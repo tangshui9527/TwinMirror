@@ -1,9 +1,7 @@
 package com.example.remotescreen
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.MotionEvent
@@ -68,13 +66,6 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         btnRecent.setOnClickListener { controller?.sendKey(187) }
 
         setupTouchForwarding()
-
-        // Request notification permission on Android 13+
-        if (Build.VERSION.SDK_INT >= 33) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-            }
-        }
     }
 
     private fun parseAddress(addr: String): Pair<String, Int> {

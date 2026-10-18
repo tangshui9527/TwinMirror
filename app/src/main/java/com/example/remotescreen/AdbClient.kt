@@ -61,11 +61,8 @@ class AdbClient(private val context: Context, private val host: String, private 
     }
 
     fun connect() {
-        // Ensure service is running
-        if (!AdbKeepAliveService.isRunning()) {
-            AdbKeepAliveService.start(context, ADB_PORT)
-            Thread.sleep(800) // wait for server to start
-        }
+        // Start adb server as a plain daemon (no foreground service / notification)
+        execAdb(listOf("start-server"))
         var result = ""
         for (i in 1..3) {
             result = execAdb(listOf("connect", serial))

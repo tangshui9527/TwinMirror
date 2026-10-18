@@ -196,7 +196,6 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         try { captureThread?.interrupt() } catch (_: Exception) {}
         try { cmdThread?.interrupt() } catch (_: Exception) {}
         try { adb?.close() } catch (_: Exception) {}
-        try { AdbKeepAliveService.stop(context) } catch (_: Exception) {}
         adb = null
         listener.onDisconnected()
     }
