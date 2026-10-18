@@ -99,20 +99,25 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
             val ctrl = controller ?: return@setOnTouchListener false
             if (videoWidth == 0 || videoHeight == 0) return@setOnTouchListener false
 
+            // Map view coords to current video frame (letterboxed)
             val sx = v.width.toFloat()
             val sy = v.height.toFloat()
             val scale = minOf(sx / videoWidth, sy / videoHeight)
             val offsetX = (sx - videoWidth * scale) / 2
             val offsetY = (sy - videoHeight * scale) / 2
-
-            val deviceX = ((event.x - offsetX) / scale).toInt().coerceIn(0, videoWidth - 1)
-            val deviceY = ((event.y - offsetY) / scale).toInt().coerceIn(0, videoHeight - 1)
+            val frameX = ((event.x - offsetX) / scale).toInt().coerceIn(0, videoWidth - 1)
+            val frameY = ((event.y - offsetY) / scale).toInt().coerceIn(0, videoHeight - 1)
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downTime = System.currentTimeMillis()
                     downX = event.x
                     downY = event.y
+                    ctrl.sendTouch(0, frameX, frameY) // immediate press - no waiting
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    ctrl.sendTouch(2, frameX, frameY) // real-time finger tracking
                     true
                 }
                 MotionEvent.ACTION_UP -> {
@@ -123,28 +128,22 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
                     val now = System.currentTimeMillis()
 
                     when {
-                        distance > 50 -> {
-                            ctrl.sendSwipeGesture(
-                                downX.toInt(), downY.toInt(),
-                                event.x.toInt(), event.y.toInt(),
-                                videoWidth, videoHeight,
-                                duration.coerceIn(100, 500).toInt()
-                            )
-                        }
-                        now - lastTapTime < 300 &&
+                        // Double tap on (possibly dark) screen -> wake up
+                        distance <= 50 && duration <= 500 &&
+                            now - lastTapTime < 300 &&
                             Math.abs(event.x - lastTapX) < 50 &&
                             Math.abs(event.y - lastTapY) < 50 -> {
                             ctrl.wakeUp()
                             lastTapTime = 0
                         }
-                        duration > 500 -> {
-                            ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, true)
-                        }
+                        // normal end of gesture: tap / long press / swipe (MOVEs already streamed)
                         else -> {
-                            ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, false)
-                            lastTapTime = now
-                            lastTapX = event.x
-                            lastTapY = event.y
+                            ctrl.sendTouch(1, frameX, frameY)
+                            if (distance < 50 && duration < 300) {
+                                lastTapTime = now
+                                lastTapX = event.x
+                                lastTapY = event.y
+                            }
                         }
                     }
                     true
@@ -163,7 +162,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     }
 
     private fun disconnect() {
-        controller?.disconnect()
+        controller?.disconnect(false) // light: keep adb alive for fast reconnect
         controller = null
         runOnUiThread {
             connectLayout.visibility = View.VISIBLE
@@ -216,7 +215,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     override fun surfaceDestroyed(holder: SurfaceHolder) {}
 
     override fun onDestroy() {
-        disconnect()
+        controller?.disconnect(true) // full cleanup when app closes
         super.onDestroy()
     }
 }

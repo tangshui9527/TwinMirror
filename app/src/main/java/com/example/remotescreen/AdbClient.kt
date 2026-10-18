@@ -39,7 +39,6 @@ class AdbClient(private val context: Context, private val host: String, private 
     private fun execAdb(args: List<String>): String {
         val adb = ensureAdb(context)
         val cmd = listOf(adb, "-P", ADB_PORT.toString()) + args
-        Log.i(TAG, "exec: ${cmd.joinToString(" ")}")
         val pb = ProcessBuilder(cmd).redirectErrorStream(true)
         pb.environment()["HOME"] = context.filesDir.absolutePath
         pb.environment()["ANDROID_DATA"] = context.filesDir.absolutePath
@@ -55,23 +54,26 @@ class AdbClient(private val context: Context, private val host: String, private 
             process.destroyForcibly()
             throw RuntimeException("adb command timeout")
         }
-        val result = output.toString().trim()
-        Log.i(TAG, "result: $result")
-        return result
+        return output.toString().trim()
     }
 
     fun connect() {
-        // Ensure service is running
         if (!AdbKeepAliveService.isRunning()) {
             AdbKeepAliveService.start(context, ADB_PORT)
-            Thread.sleep(800) // wait for server to start
+            for (i in 0 until 15) {
+                Thread.sleep(100)
+                if (AdbKeepAliveService.isRunning()) break
+            }
         }
         var result = ""
         for (i in 1..3) {
             result = execAdb(listOf("connect", serial))
             Log.i(TAG, "connect attempt $i: $result")
             if (result.contains("connected") || result.contains("already")) break
-            Thread.sleep(500)
+            Thread.sleep(200)
+        }
+        if (!result.contains("connected") && !result.contains("already")) {
+            throw RuntimeException("无法连接到 $serial")
         }
     }
 
@@ -79,25 +81,17 @@ class AdbClient(private val context: Context, private val host: String, private 
         return execAdb(listOf("-s", serial, "shell", cmd))
     }
 
-    fun openExecOut(cmd: String): Process {
-        val adb = ensureAdb(context)
-        Log.i(TAG, "openExecOut: $cmd")
-        val pb = ProcessBuilder(adb, "-P", ADB_PORT.toString(), "-s", serial, "exec-out", cmd)
-            .redirectErrorStream(false)
-        pb.environment()["HOME"] = context.filesDir.absolutePath
-        pb.environment()["ANDROID_DATA"] = context.filesDir.absolutePath
-        return pb.start()
+    fun execPush(localPath: String, remotePath: String) {
+        execAdb(listOf("-s", serial, "push", localPath, remotePath))
     }
 
-    fun push(bytes: ByteArray, remotePath: String, mode: String = "0755") {
-        val tmp = File.createTempFile("push", ".bin", context.cacheDir)
-        tmp.writeBytes(bytes)
-        try {
-            execAdb(listOf("-s", serial, "push", tmp.absolutePath, remotePath))
-        } finally {
-            tmp.delete()
-        }
-        execShell("chmod $mode $remotePath")
+    fun forward(local: String, remote: String) {
+        val result = execAdb(listOf("-s", serial, "forward", local, remote))
+        Log.i(TAG, "forward: $result")
+    }
+
+    fun removeForward(local: String) {
+        execAdb(listOf("-s", serial, "forward", "--remove", local))
     }
 
     fun close() {

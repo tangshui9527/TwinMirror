@@ -137,7 +137,7 @@ class AdbKeepAliveService : Service() {
                     }
                 } catch (_: Exception) {}
             }.apply { isDaemon = true; start() }
-            Thread.sleep(1000)
+            Thread.sleep(300) // shorter wait
             Log.i(TAG, "adb server started (alive=${p.isAlive})")
         }
     }
