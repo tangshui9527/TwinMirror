@@ -3,13 +3,12 @@ package com.example.remotescreen
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.util.Log
-import android.view.Surface
-import android.view.SurfaceHolder
-import java.io.BufferedInputStream
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 /**
  * Screen mirroring using screencap polling + input commands for control.
- * More stable than video streaming, no garbled frames.
  */
 class ScrcpyController(private val context: Context, private val listener: Listener) {
 
@@ -27,10 +26,13 @@ class ScrcpyController(private val context: Context, private val listener: Liste
     @Volatile private var running = false
     private var deviceWidth = 0
     private var deviceHeight = 0
-    private var lastBitmap: android.graphics.Bitmap? = null
+
+    // Touch command queue to serialize ADB input commands
+    private val cmdQueue = LinkedBlockingQueue<String>()
+    private var cmdThread: Thread? = null
 
     fun connect(host: String, port: Int) {
-        Thread {
+        thread(name = "connect") {
             try {
                 listener.onLog("连接 ADB: $host:$port ...")
                 val client = AdbClient(context, host, port)
@@ -38,13 +40,11 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 adb = client
                 listener.onLog("ADB 已连接")
 
-                // Wake up target device and keep screen on
+                // Wake up and keep screen on
                 listener.onLog("唤醒目标设备 ...")
                 client.execShell("input keyevent KEYCODE_WAKEUP")
                 client.execShell("wm dismiss-keyguard")
-                // Keep screen on for 30 minutes
                 client.execShell("settings put system screen_off_timeout 1800000")
-                // Also try svc power stayon (requires root on some devices)
                 try { client.execShell("svc power stayon true") } catch (_: Exception) {}
                 Thread.sleep(200)
 
@@ -64,31 +64,38 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 running = true
                 listener.onConnected()
 
-                // Start keep-alive
-                keepAliveThread = Thread {
+                // Start command worker
+                cmdThread = thread(name = "cmd-worker", isDaemon = true) {
                     while (running) {
                         try {
-                            Thread.sleep(30000) // every 30s
-                            if (running) {
-                                adb?.execShell("input keyevent KEYCODE_WAKEUP")
+                            val cmd = cmdQueue.poll(100, TimeUnit.MILLISECONDS)
+                            if (cmd != null) {
+                                adb?.execShell(cmd)
                             }
-                        } catch (e: Exception) { break }
+                        } catch (e: InterruptedException) { break }
+                          catch (e: Exception) { Log.e(TAG, "Cmd failed", e) }
                     }
-                }.apply { isDaemon = true; start() }
+                }
+
+                // Start keep-alive
+                keepAliveThread = thread(name = "keep-alive", isDaemon = true) {
+                    while (running) {
+                        Thread.sleep(30000)
+                        if (running) adb?.execShell("input keyevent KEYCODE_WAKEUP")
+                    }
+                }
 
                 // Start screen capture polling
-                captureThread = Thread { captureLoop() }.apply {
-                    name = "screen-capture"
-                    isDaemon = true
-                    start()
+                captureThread = thread(name = "screen-capture", isDaemon = true) {
+                    captureLoop()
                 }
 
             } catch (e: Exception) {
                 listener.onError("连接失败: ${e.message}")
-                e.printStackTrace()
+                Log.e(TAG, "Connect failed", e)
                 disconnect()
             }
-        }.start()
+        }
     }
 
     private fun captureLoop() {
@@ -96,26 +103,27 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         while (running) {
             try {
                 val client = adb ?: break
-                // Capture screen as PNG
                 val proc = client.openExecOut("screencap -p")
                 val bytes = proc.inputStream.readBytes()
-                proc.waitFor()
+                // Wait with timeout to avoid hanging
+                if (!proc.waitFor(5, TimeUnit.SECONDS)) {
+                    proc.destroyForcibly()
+                    throw RuntimeException("screencap timeout")
+                }
 
                 if (bytes.isNotEmpty() && running) {
                     val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     if (bitmap != null) {
-                        lastBitmap?.recycle()
-                        lastBitmap = bitmap
-                        failCount = 0
-                        // Draw to surface
                         drawToSurface(bitmap)
+                        bitmap.recycle()
+                        failCount = 0
                     }
                 }
 
-                // ~5 FPS for stability
-                Thread.sleep(200)
+                Thread.sleep(200) // ~5 FPS
             } catch (e: Exception) {
                 failCount++
+                Log.e(TAG, "Capture failed ($failCount)", e)
                 if (failCount > 10) {
                     if (running) listener.onError("截图失败多次: ${e.message}")
                     break
@@ -129,98 +137,66 @@ class ScrcpyController(private val context: Context, private val listener: Liste
 
     private fun drawToSurface(bitmap: android.graphics.Bitmap) {
         val holder = VideoDecoderHolder.holder ?: return
-        val canvas = holder.lockCanvas() ?: return
         try {
-            // Clear and draw with aspect ratio
-            canvas.drawColor(android.graphics.Color.BLACK)
-            val bw = bitmap.width.toFloat()
-            val bh = bitmap.height.toFloat()
-            val cw = canvas.width.toFloat()
-            val ch = canvas.height.toFloat()
-            val scale = minOf(cw / bw, ch / bh)
-            val dx = (cw - bw * scale) / 2
-            val dy = (ch - bh * scale) / 2
-            val dstRect = android.graphics.RectF(dx, dy, dx + bw * scale, dy + bh * scale)
-            canvas.drawBitmap(bitmap, null, dstRect, null)
-        } finally {
-            holder.unlockCanvasAndPost(canvas)
+            val canvas = holder.lockCanvas() ?: return
+            try {
+                canvas.drawColor(android.graphics.Color.BLACK)
+                val bw = bitmap.width.toFloat()
+                val bh = bitmap.height.toFloat()
+                val cw = canvas.width.toFloat()
+                val ch = canvas.height.toFloat()
+                val scale = minOf(cw / bw, ch / bh)
+                val dx = (cw - bw * scale) / 2
+                val dy = (ch - bh * scale) / 2
+                canvas.drawBitmap(bitmap, null, android.graphics.RectF(dx, dy, dx + bw * scale, dy + bh * scale), null)
+            } finally {
+                holder.unlockCanvasAndPost(canvas)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Draw failed", e)
         }
     }
 
-    /** Send tap, long press, or swipe at device coordinates */
+    /** Send tap or long press at device coordinates */
     fun sendTouch(action: Int, x: Int, y: Int, width: Int, height: Int, isLongPress: Boolean = false) {
-        val client = adb ?: return
+        if (!running || deviceWidth == 0) return
         val dx = (x * deviceWidth / width).coerceIn(0, deviceWidth - 1)
         val dy = (y * deviceHeight / height).coerceIn(0, deviceHeight - 1)
-        Thread {
-            try {
-                if (action == 1) { // UP
-                    if (isLongPress) {
-                        client.execShell("input swipe $dx $dy $dx $dy 800")
-                    } else {
-                        client.execShell("input tap $dx $dy")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Touch failed", e)
-            }
-        }.start()
+        if (action == 1) {
+            val cmd = if (isLongPress) "input swipe $dx $dy $dx $dy 800" else "input tap $dx $dy"
+            cmdQueue.offer(cmd)
+        }
     }
 
-    /** Send swipe gesture from (x1,y1) to (x2,y2) */
+    /** Send swipe gesture from (x1,y1) to (x2,y2) in view coordinates */
     fun sendSwipeGesture(x1: Int, y1: Int, x2: Int, y2: Int, width: Int, height: Int, durationMs: Int = 300) {
-        val client = adb ?: return
+        if (!running || deviceWidth == 0) return
         val dx1 = (x1 * deviceWidth / width).coerceIn(0, deviceWidth - 1)
         val dy1 = (y1 * deviceHeight / height).coerceIn(0, deviceHeight - 1)
         val dx2 = (x2 * deviceWidth / width).coerceIn(0, deviceWidth - 1)
         val dy2 = (y2 * deviceHeight / height).coerceIn(0, deviceHeight - 1)
-        Thread {
-            try {
-                client.execShell("input swipe $dx1 $dy1 $dx2 $dy2 $durationMs")
-            } catch (e: Exception) {
-                Log.e(TAG, "Swipe failed", e)
-            }
-        }.start()
-    }
-
-    fun sendSwipe(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int = 300) {
-        val client = adb ?: return
-        Thread {
-            try {
-                client.execShell("input swipe $x1 $y1 $x2 $y2 $durationMs")
-            } catch (e: Exception) { Log.e(TAG, "Swipe failed", e) }
-        }.start()
-    }
-
-    fun sendBack() {
-        Thread { adb?.execShell("input keyevent 4") }.start()
+        cmdQueue.offer("input swipe $dx1 $dy1 $dx2 $dy2 $durationMs")
     }
 
     fun sendKey(keycode: Int) {
-        Thread { adb?.execShell("input keyevent $keycode") }.start()
+        if (!running) return
+        cmdQueue.offer("input keyevent $keycode")
     }
 
-    /** Wake up the target device */
     fun wakeUp() {
-        Thread {
-            try {
-                adb?.execShell("input keyevent KEYCODE_WAKEUP")
-                adb?.execShell("wm dismiss-keyguard")
-            } catch (e: Exception) {
-                Log.e(TAG, "Wake failed", e)
-            }
-        }.start()
+        if (!running) return
+        cmdQueue.offer("input keyevent KEYCODE_WAKEUP")
+        cmdQueue.offer("wm dismiss-keyguard")
     }
 
     fun disconnect() {
         running = false
+        cmdQueue.clear()
         try { keepAliveThread?.interrupt() } catch (_: Exception) {}
         try { captureThread?.interrupt() } catch (_: Exception) {}
-        try { adb?.execShell("pkill -f screencap") } catch (_: Exception) {}
+        try { cmdThread?.interrupt() } catch (_: Exception) {}
         try { adb?.close() } catch (_: Exception) {}
         try { AdbKeepAliveService.stop(context) } catch (_: Exception) {}
-        lastBitmap?.recycle()
-        lastBitmap = null
         adb = null
         listener.onDisconnected()
     }

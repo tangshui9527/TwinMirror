@@ -51,7 +51,10 @@ class AdbClient(private val context: Context, private val host: String, private 
                 output.appendLine(line)
             }
         }
-        process.waitFor()
+        if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            throw RuntimeException("adb command timeout")
+        }
         val result = output.toString().trim()
         Log.i(TAG, "result: $result")
         return result
