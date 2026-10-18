@@ -1,4 +1,4 @@
-# RemoteScreen 远程投屏
+# TwinMirror
 
 Android 局域网远程投屏控制器：在控制端手机上实时查看并操控另一台 Android 手机，**目标手机无需安装任何 App**，只靠 ADB。
 
