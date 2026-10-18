@@ -38,10 +38,14 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 adb = client
                 listener.onLog("ADB 已连接")
 
-                // Wake up target device
+                // Wake up target device and keep screen on
                 listener.onLog("唤醒目标设备 ...")
                 client.execShell("input keyevent KEYCODE_WAKEUP")
                 client.execShell("wm dismiss-keyguard")
+                // Keep screen on for 30 minutes
+                client.execShell("settings put system screen_off_timeout 1800000")
+                // Also try svc power stayon (requires root on some devices)
+                try { client.execShell("svc power stayon true") } catch (_: Exception) {}
                 Thread.sleep(200)
 
                 // Get screen resolution
@@ -64,8 +68,10 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 keepAliveThread = Thread {
                     while (running) {
                         try {
-                            Thread.sleep(15000)
-                            if (running) adb?.execShell("echo ka")
+                            Thread.sleep(30000) // every 30s
+                            if (running) {
+                                adb?.execShell("input keyevent KEYCODE_WAKEUP")
+                            }
                         } catch (e: Exception) { break }
                     }
                 }.apply { isDaemon = true; start() }
@@ -192,6 +198,18 @@ class ScrcpyController(private val context: Context, private val listener: Liste
 
     fun sendKey(keycode: Int) {
         Thread { adb?.execShell("input keyevent $keycode") }.start()
+    }
+
+    /** Wake up the target device */
+    fun wakeUp() {
+        Thread {
+            try {
+                adb?.execShell("input keyevent KEYCODE_WAKEUP")
+                adb?.execShell("wm dismiss-keyguard")
+            } catch (e: Exception) {
+                Log.e(TAG, "Wake failed", e)
+            }
+        }.start()
     }
 
     fun disconnect() {

@@ -94,6 +94,10 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         var downTime = 0L
         var downX = 0f
         var downY = 0f
+        var lastTapTime = 0L
+        var lastTapX = 0f
+        var lastTapY = 0f
+
         surfaceView.setOnTouchListener { v, event ->
             val ctrl = controller ?: return@setOnTouchListener false
             if (videoWidth == 0 || videoHeight == 0) return@setOnTouchListener false
@@ -120,19 +124,31 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
                     val dx = event.x - downX
                     val dy = event.y - downY
                     val distance = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+                    val now = System.currentTimeMillis()
 
                     when {
-                        // Swipe: significant movement
+                        // Swipe
                         distance > 50 -> {
                             ctrl.sendSwipeGesture(downX.toInt(), downY.toInt(), event.x.toInt(), event.y.toInt(), videoWidth, videoHeight, duration.coerceIn(100, 500).toInt())
                         }
-                        // Long press: held for >500ms with little movement
+                        // Double tap detection (within 300ms and close position)
+                        now - lastTapTime < 300 &&
+                            Math.abs(event.x - lastTapX) < 50 &&
+                            Math.abs(event.y - lastTapY) < 50 -> {
+                            // Double tap detected - wake up device
+                            ctrl.wakeUp()
+                            lastTapTime = 0
+                        }
+                        // Long press
                         duration > 500 -> {
                             ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, true)
                         }
                         // Tap
                         else -> {
                             ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, false)
+                            lastTapTime = now
+                            lastTapX = event.x
+                            lastTapY = event.y
                         }
                     }
                     true
