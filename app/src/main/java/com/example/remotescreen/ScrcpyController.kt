@@ -141,7 +141,7 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         }
     }
 
-    /** Send tap or long press at device coordinates */
+    /** Send tap, long press, or swipe at device coordinates */
     fun sendTouch(action: Int, x: Int, y: Int, width: Int, height: Int, isLongPress: Boolean = false) {
         val client = adb ?: return
         val dx = (x * deviceWidth / width).coerceIn(0, deviceWidth - 1)
@@ -150,7 +150,6 @@ class ScrcpyController(private val context: Context, private val listener: Liste
             try {
                 if (action == 1) { // UP
                     if (isLongPress) {
-                        // Long press: swipe to same point with duration
                         client.execShell("input swipe $dx $dy $dx $dy 800")
                     } else {
                         client.execShell("input tap $dx $dy")
@@ -158,6 +157,22 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Touch failed", e)
+            }
+        }.start()
+    }
+
+    /** Send swipe gesture from (x1,y1) to (x2,y2) */
+    fun sendSwipeGesture(x1: Int, y1: Int, x2: Int, y2: Int, width: Int, height: Int, durationMs: Int = 300) {
+        val client = adb ?: return
+        val dx1 = (x1 * deviceWidth / width).coerceIn(0, deviceWidth - 1)
+        val dy1 = (y1 * deviceHeight / height).coerceIn(0, deviceHeight - 1)
+        val dx2 = (x2 * deviceWidth / width).coerceIn(0, deviceWidth - 1)
+        val dy2 = (y2 * deviceHeight / height).coerceIn(0, deviceHeight - 1)
+        Thread {
+            try {
+                client.execShell("input swipe $dx1 $dy1 $dx2 $dy2 $durationMs")
+            } catch (e: Exception) {
+                Log.e(TAG, "Swipe failed", e)
             }
         }.start()
     }

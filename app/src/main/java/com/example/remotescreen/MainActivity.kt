@@ -92,6 +92,8 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     @SuppressLint("ClickableViewAccessibility")
     private fun setupTouchForwarding() {
         var downTime = 0L
+        var downX = 0f
+        var downY = 0f
         surfaceView.setOnTouchListener { v, event ->
             val ctrl = controller ?: return@setOnTouchListener false
             if (videoWidth == 0 || videoHeight == 0) return@setOnTouchListener false
@@ -109,12 +111,30 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downTime = System.currentTimeMillis()
+                    downX = event.x
+                    downY = event.y
                     true
                 }
                 MotionEvent.ACTION_UP -> {
                     val duration = System.currentTimeMillis() - downTime
-                    val isLongPress = duration > 500
-                    ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, isLongPress)
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    val distance = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+
+                    when {
+                        // Swipe: significant movement
+                        distance > 50 -> {
+                            ctrl.sendSwipeGesture(downX.toInt(), downY.toInt(), event.x.toInt(), event.y.toInt(), videoWidth, videoHeight, duration.coerceIn(100, 500).toInt())
+                        }
+                        // Long press: held for >500ms with little movement
+                        duration > 500 -> {
+                            ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, true)
+                        }
+                        // Tap
+                        else -> {
+                            ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, false)
+                        }
+                    }
                     true
                 }
                 else -> false
