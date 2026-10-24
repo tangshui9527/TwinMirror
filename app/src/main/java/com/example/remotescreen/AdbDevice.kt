@@ -1,6 +1,5 @@
 package com.example.remotescreen
 
-import android.util.Base64
 import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
@@ -49,28 +48,49 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
         private const val A_VERSION = 0x01000001
         private const val MAX_PAYLOAD = 256 * 1024
         private const val AUTH_TIMEOUT_MS = 120_000L
+        private const val WRTE_CHUNK = 4096 // legacy-safe adb payload cap
 
-        /** Loads (or creates) the persisted RSA keypair. */
+        private val keyLock = Any()
+
+        /** Key fingerprint (first 8 bytes of the pubkey struct, hex) for logging. */
+        fun fingerprint(pair: KeyPair): String {
+            val b = adbPubkeyLine(pair)
+            val sb = StringBuilder()
+            for (i in 0 until 8) sb.append(String.format("%02x", b[i]))
+            return sb.toString()
+        }
+
+        /**
+         * Loads (or creates) the persisted RSA keypair. Class-level lock: connect
+         * threads from multiple controller instances may race here, and two concurrent
+         * generations would silently replace each other. commit() (synchronous) so the
+         * key cannot be lost to a pending async write at process death.
+         */
         fun loadOrCreateKey(context: android.content.Context): KeyPair {
-            val prefs = context.getSharedPreferences("adb_keys", android.content.Context.MODE_PRIVATE)
-            val privB64 = prefs.getString("priv_pkcs8", null)
-            val factory = KeyFactory.getInstance("RSA")
-            if (privB64 != null) {
-                try {
-                    val priv = factory.generatePrivate(PKCS8EncodedKeySpec(JavaBase64.getDecoder().decode(privB64)))
-                    val pub = factory.generatePublic(java.security.spec.X509EncodedKeySpec(
-                        JavaBase64.getDecoder().decode(prefs.getString("pub_x509", ""))))
-                    return KeyPair(pub, priv)
-                } catch (e: Exception) {
-                    Log.w(TAG, "stored adb key unreadable, regenerating", e)
+            synchronized(keyLock) {
+                val prefs = context.getSharedPreferences("adb_keys", android.content.Context.MODE_PRIVATE)
+                val privB64 = prefs.getString("priv_pkcs8", null)
+                val factory = KeyFactory.getInstance("RSA")
+                if (privB64 != null) {
+                    try {
+                        val priv = factory.generatePrivate(PKCS8EncodedKeySpec(JavaBase64.getDecoder().decode(privB64)))
+                        val pub = factory.generatePublic(java.security.spec.X509EncodedKeySpec(
+                            JavaBase64.getDecoder().decode(prefs.getString("pub_x509", ""))))
+                        val loaded = KeyPair(pub, priv)
+                        Log.i(TAG, "adb key loaded, fp=${fingerprint(loaded)}")
+                        return loaded
+                    } catch (e: Exception) {
+                        Log.w(TAG, "stored adb key unreadable, regenerating", e)
+                    }
                 }
+                val kp = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+                prefs.edit()
+                    .putString("priv_pkcs8", JavaBase64.getEncoder().encodeToString(kp.private.encoded))
+                    .putString("pub_x509", JavaBase64.getEncoder().encodeToString(kp.public.encoded))
+                    .commit()
+                Log.i(TAG, "adb key GENERATED, fp=${fingerprint(kp)}")
+                return kp
             }
-            val kp = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
-            prefs.edit()
-                .putString("priv_pkcs8", JavaBase64.getEncoder().encodeToString(kp.private.encoded))
-                .putString("pub_x509", JavaBase64.getEncoder().encodeToString(kp.public.encoded))
-                .apply()
-            return kp
         }
 
         /**
@@ -111,7 +131,6 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
 
     private var socket: Socket? = null
     private var out: java.io.OutputStream? = null
-    private var input: InputStream? = null
     private val outLock = Any()
     private val streams = ConcurrentHashMap<Int, ShellStream>()
     private var nextLocalId = 1
@@ -122,51 +141,69 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
     fun connect(keyPair: KeyPair, onWaitingAuth: (() -> Unit)? = null) {
         this.keyPair = keyPair
         val s = Socket()
-        s.connect(InetSocketAddress(host, port), 5_000)
-        s.soTimeout = 10_000
-        socket = s
-        out = s.getOutputStream()
-        input = s.getInputStream()
+        try {
+            s.connect(InetSocketAddress(host, port), 5_000)
+            s.soTimeout = 10_000
+            socket = s
+            out = s.getOutputStream()
 
-        send(
-            Message(
-                A_CNXN, A_VERSION, MAX_PAYLOAD,
-                "host::features=shell_v2,cmd,stat_v2,ls_v2".toByteArray(Charsets.UTF_8)
+            send(
+                Message(
+                    A_CNXN, A_VERSION, MAX_PAYLOAD,
+                    "host::features=shell_v2,cmd,stat_v2,ls_v2".toByteArray(Charsets.UTF_8)
+                )
             )
-        )
 
-        var sentPubkey = false
-        var loggedWaiting = false
-        val deadline = System.currentTimeMillis() + AUTH_TIMEOUT_MS
-        while (true) {
-            val remaining = deadline - System.currentTimeMillis()
-            if (remaining <= 0) throw UnauthorizedException("目标设备授权超时（未在目标手机上允许调试）")
-            s.soTimeout = remaining.coerceAtMost(10_000).toInt()
-            val msg = try { readMessage(s.getInputStream()) } catch (e: java.net.SocketTimeoutException) {
-                if (loggedWaiting && sentPubkey) continue
-                throw IOException("连接目标设备无响应: ${e.message}")
-            }
-            when (msg.cmd) {
-                A_CNXN -> break
-                A_AUTH -> {
-                    if (respondToAuth(msg, sentPubkey, onWaitingAuth)) sentPubkey = true
+            var sentPubkey = false
+            var loggedWaiting = false
+            var tokenCount = 0
+            val deadline = System.currentTimeMillis() + AUTH_TIMEOUT_MS
+            while (true) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) throw UnauthorizedException("目标设备授权超时（未在目标手机上允许调试）")
+                s.soTimeout = remaining.coerceAtMost(10_000).toInt()
+                val msg = try { readMessage(s.getInputStream()) } catch (e: java.net.SocketTimeoutException) {
+                    if (loggedWaiting && sentPubkey) continue
+                    throw IOException("连接目标设备无响应: ${e.message}")
                 }
-                else -> Log.w(TAG, "unexpected message during handshake: ${msg.cmd}")
+                when (msg.cmd) {
+                    A_CNXN -> break
+                    A_AUTH -> {
+                        tokenCount++
+                        // Signature-only on the first token (an authorized key connects
+                        // without any dialog); pubkey on the second, after rejection.
+                        if (respondToAuth(msg, sentPubkey, tokenCount >= 2, onWaitingAuth)) sentPubkey = true
+                    }
+                    else -> Log.w(TAG, "unexpected message during handshake: ${msg.cmd}")
+                }
             }
+        } catch (e: Exception) {
+            pumpAlive = false
+            try { s.close() } catch (_: Exception) {}
+            socket = null
+            out = null
+            throw e
         }
         s.soTimeout = 0
         pumpAlive = true
-        thread(name = "adb-pump", isDaemon = true) {
-            Log.i(TAG, "adb pump starting")
-            pump()
-        }
+        thread(name = "adb-pump", isDaemon = true) { pump() }
         Log.i(TAG, "adb connected to $host:$port")
     }
 
+    /**
+     * Legacy adb auth signature: PKCS#1 v1.5 over the SHA-1 DigestInfo prefix
+     * concatenated with the RAW token — NO actual hashing. This mirrors the reference
+     * client's RSA_sign(NID_sha1, token, ...) semantics (verified byte-identical
+     * against a real adb client's signature on-device). A real SHA-1 digest here is
+     * silently rejected by adbd, which makes every key look unauthorized.
+     */
     private fun sign(pair: KeyPair, token: ByteArray): ByteArray {
-        val sig = Signature.getInstance("SHA1withRSA")
+        val digestInfo = byteArrayOf(
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
+        ) + token
+        val sig = Signature.getInstance("NONEwithRSA")
         sig.initSign(pair.private)
-        sig.update(token)
+        sig.update(digestInfo)
         return sig.sign()
     }
 
@@ -176,20 +213,21 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
      * was newly sent. Some ROMs re-challenge with a fresh token even after CNXN, so the
      * pump uses this too.
      */
-    private fun respondToAuth(msg: Message, pubkeySent: Boolean, onWaitingAuth: (() -> Unit)?): Boolean {
+    private fun respondToAuth(
+        msg: Message,
+        pubkeySent: Boolean,
+        allowPubkey: Boolean,
+        onWaitingAuth: (() -> Unit)?
+    ): Boolean {
         if (msg.arg0 != 1) return pubkeySent // A_AUTH token expected
         val pair = keyPair ?: return pubkeySent
-        send(Message(A_AUTH, 2, 0, sign(pair, msg.data))) // SIGNATURE
-        return if (!pubkeySent) {
-            val keyLine = adbPubkeyLine(pair)
-            send(Message(A_AUTH, 3, 0, keyLine)) // RSAPUBLICKEY
-            onWaitingAuth?.invoke()
-            Log.i(TAG, "ADB_PUBKEY:" + String(keyLine, Charsets.UTF_8))
-            Log.i(TAG, "waiting for user to authorize on the target device")
-            true
-        } else {
-            pubkeySent
-        }
+        send(Message(A_AUTH, 2, 0, sign(pair, msg.data))) // SIGNATURE first, like the reference client
+        if (pubkeySent || !allowPubkey) return pubkeySent
+        val keyLine = adbPubkeyLine(pair)
+        send(Message(A_AUTH, 3, 0, keyLine)) // RSAPUBLICKEY — only after a rejection
+        onWaitingAuth?.invoke()
+        Log.i(TAG, "waiting for user to authorize on the target device")
+        return true
     }
 
     /**
@@ -321,12 +359,15 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
                     A_OKAY -> streams[msg.arg1]?.let {
                         it.remoteId = msg.arg0
                         it.openAck.countDown()
+                        it.writeGateOpen()
                     }
                     A_CLSE -> {
                         val st = streams.remove(msg.arg1)
                         st?.markClosed()
                     }
-                    A_AUTH -> respondToAuth(msg, true, null) // some ROMs re-challenge mid-session
+                    // ROMs re-challenge mid-session; if the key was revoked this also
+                    // re-triggers the authorization dialog so the user can re-allow it
+                    A_AUTH -> respondToAuth(msg, false, true, null)
                     else -> Log.w(TAG, "pump: unexpected cmd ${msg.cmd}")
                 }
             }
@@ -346,20 +387,49 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
         val stderrBuf = java.io.ByteArrayOutputStream()
         val input: InputStream by lazy { inputStream() }
 
-        /** Writes data to the command's stdin. In shell v2, client->device payloads are
-         *  v2-framed too: [id=0 STDIN][len u32 LE][data]. */
-        fun writeStdin(data: ByteArray) {
+        // ADB flow control: one unacknowledged WRTE per stream. Closed before each
+        // write, opened by the pump on OKAY.
+        private var writeGate = java.util.concurrent.CountDownLatch(0)
+
+        fun writeGateOpen() { writeGate.countDown() }
+
+        private fun writeOne(payload: ByteArray) {
             val r = remoteId
             if (r <= 0) return
-            if (!parseV2) {
-                send(Message(A_WRTE, localId, r, data))
-                return
+            synchronized(this) {
+                // Bounded wait: an adbd that skips acks must not hard-block us
+                try { writeGate.await(5, TimeUnit.SECONDS) } catch (_: InterruptedException) { return }
+                val gate = java.util.concurrent.CountDownLatch(1)
+                writeGate = gate
+                try {
+                    send(Message(A_WRTE, localId, r, payload))
+                } catch (e: Exception) {
+                    gate.countDown()
+                    throw e
+                }
             }
-            val frame = ByteBuffer.allocate(5 + data.size).order(ByteOrder.LITTLE_ENDIAN)
-            frame.put(0) // ID STDIN
-            frame.putInt(data.size)
-            frame.put(data)
-            send(Message(A_WRTE, localId, r, frame.array()))
+        }
+
+        /** Writes data to the command's stdin. In shell v2, client->device payloads are
+         *  v2-framed too: [id=0 STDIN][len u32 LE][data]. Data is chunked to the legacy
+         *  4KB payload cap and paced one WRTE per OKAY. */
+        fun writeStdin(data: ByteArray) {
+            var off = 0
+            while (off < data.size) {
+                val n = minOf(WRTE_CHUNK, data.size - off)
+                val chunk = data.copyOfRange(off, off + n)
+                val payload: ByteArray = if (!parseV2) {
+                    chunk
+                } else {
+                    val frame = ByteBuffer.allocate(5 + chunk.size).order(ByteOrder.LITTLE_ENDIAN)
+                    frame.put(0) // ID STDIN
+                    frame.putInt(chunk.size)
+                    frame.put(chunk)
+                    frame.array()
+                }
+                writeOne(payload)
+                off += n
+            }
         }
 
         /** Tells the shell stdin is finished (v2 close-stdin message). */
@@ -369,7 +439,7 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
             val frame = ByteBuffer.allocate(5).order(ByteOrder.LITTLE_ENDIAN)
             frame.put(4) // ID CLOSE_STDIN
             frame.putInt(0)
-            send(Message(A_WRTE, localId, r, frame.array()))
+            writeOne(frame.array())
         }
 
         fun output(): java.io.OutputStream = object : java.io.OutputStream() {
@@ -435,15 +505,26 @@ class AdbDevice(val host: String, val port: Int) : Closeable {
                 return if (n < 0) -1 else (b[0].toInt() and 0xFF)
             }
 
+            var rawRemainder: ByteArray? = null
+
             override fun read(b: ByteArray, off: Int, len: Int): Int {
                 while (true) {
                     if (!parseV2) {
+                        // Partial chunks stay local: requeueing to the tail would put
+                        // them behind chunks that arrived later and reorder the stream.
+                        val rem = rawRemainder
+                        if (rem != null) {
+                            val n = minOf(len, rem.size)
+                            System.arraycopy(rem, 0, b, off, n)
+                            rawRemainder = if (n < rem.size) rem.copyOfRange(n, rem.size) else null
+                            return n
+                        }
                         if (eof && queue.isEmpty()) return -1
                         val chunk = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
                         if (chunk.isEmpty()) return -1
                         val n = minOf(len, chunk.size)
                         System.arraycopy(chunk, 0, b, off, n)
-                        if (n < chunk.size) queue.offer(chunk.copyOfRange(n, chunk.size))
+                        if (n < chunk.size) rawRemainder = chunk.copyOfRange(n, chunk.size)
                         return n
                     }
                     if (pos < pending.size()) {

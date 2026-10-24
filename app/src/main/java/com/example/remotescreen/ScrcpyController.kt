@@ -7,8 +7,8 @@ import android.util.Log
 import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.io.IOException
-import java.io.InputStream
 import java.nio.ByteBuffer
+import java.security.KeyPair
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -31,7 +31,7 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         fun onDisconnected()
     }
 
-    private val keyPair = AdbDevice.loadOrCreateKey(context)
+    private var keyPair: KeyPair? = null // generated lazily on the connect thread (RSA keygen is slow)
     private var device: AdbDevice? = null
     private var videoStream: AdbDevice.ShellStream? = null
     private var controlStream: AdbDevice.ShellStream? = null
@@ -42,10 +42,6 @@ class ScrcpyController(private val context: Context, private val listener: Liste
     @Volatile private var running = false
     @Volatile private var cancelled = false
     private val disconnected = AtomicBoolean(false)
-
-    // Physical screen size (from wm size, for logs)
-    private var devicePhysicalWidth = 0
-    private var devicePhysicalHeight = 0
 
     // Current video frame size (touch injection coordinate frame; updated on rotation via SPS)
     private var videoWidth = 0
@@ -68,19 +64,16 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         thread(name = "connect") {
             try {
                 listener.onLog("连接目标设备: $host:$port ...")
-                val dev = AdbDevice(host, port)
-                dev.connect(keyPair) { listener.onLog("请在目标手机上允许 ADB 调试 ...") }
+                val pair = keyPair ?: AdbDevice.loadOrCreateKey(context).also { keyPair = it }
+                val dev = connectWithAuthRetries(host, port, pair)
                 if (cancelled) { dev.close(); return@thread }
                 device = dev
 
                 dev.exec("input keyevent KEYCODE_WAKEUP", 8_000)
                 runCatching { dev.exec("wm dismiss-keyguard", 8_000) }
-                val wmSize = dev.exec("wm size", 8_000)
-                Regex("Physical size: (\\d+)x(\\d+)").find(wmSize)?.let {
-                    devicePhysicalWidth = it.groupValues[1].toInt()
-                    devicePhysicalHeight = it.groupValues[2].toInt()
-                }
-                Log.i(TAG, "physical ${devicePhysicalWidth}x${devicePhysicalHeight}")
+                runCatching { dev.exec("wm size", 8_000) }.getOrNull()
+                    ?.let { Regex("Physical size: (\\d+)x(\\d+)").find(it) }
+                    ?.let { Log.i(TAG, "physical ${it.groupValues[1]}x${it.groupValues[2]}") }
 
                 listener.onLog("推送 scrcpy-server ...")
                 pushScrcpyServer(dev)
@@ -107,6 +100,7 @@ class ScrcpyController(private val context: Context, private val listener: Liste
 
                 listener.onLog("连接视频流 ...")
                 val video = openVideoSocket()
+                videoStream = video
                 controlStream = openControlSocket()
                 control = ControlChannel(controlStream!!.output())
 
@@ -138,6 +132,30 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 Log.e(TAG, "Connect failed", e)
                 listener.onError("连接失败: ${e.message}")
                 disconnect()
+            }
+        }
+    }
+
+    /**
+     * adbd drops sockets stuck in the auth handshake after ~20s; real adb clients
+     * transparently reconnect, so the authorization dialog just reappears until
+     * answered. Do the same instead of failing the whole connect.
+     */
+    private fun connectWithAuthRetries(host: String, port: Int, pair: KeyPair): AdbDevice {
+        var authRetries = 0
+        while (true) {
+            val d = AdbDevice(host, port)
+            try {
+                d.connect(pair) { listener.onLog("请在目标手机上允许 ADB 调试 ...") }
+                return d
+            } catch (e: AdbDevice.UnauthorizedException) {
+                d.close()
+                throw e // the full 120s was spent waiting; give up
+            } catch (e: Exception) {
+                d.close()
+                authRetries++
+                if (authRetries >= 4 || cancelled) throw e
+                Thread.sleep(500)
             }
         }
     }
@@ -197,22 +215,36 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         var codec: MediaCodec? = null
         var sps: ByteArray? = null
         var pps: ByteArray? = null
-        var lastSpsWidth = 0
         try {
             // The SurfaceView surface exists only after the video layout becomes visible
-            var surface = VideoDecoderHolder.surface
+            var currentSurface = VideoDecoderHolder.surface
             var waited = 0
-            while (surface == null && waited < 5000) {
+            while (currentSurface == null && waited < 5000) {
                 Thread.sleep(100)
                 waited += 100
-                surface = VideoDecoderHolder.surface
+                currentSurface = VideoDecoderHolder.surface
             }
-            val safeSurface = surface ?: throw IllegalStateException("Surface not ready")
+            if (currentSurface == null) throw IllegalStateException("Surface not ready")
 
             val readBuf = ByteArray(65536)
             val nalBuf = java.io.ByteArrayOutputStream(256 * 1024)
 
             while (running) {
+                // The SurfaceView is destroyed and recreated on app pause/resume; the
+                // decoder must follow or it keeps rendering to a dead surface.
+                val liveSurface = VideoDecoderHolder.surface
+                if (liveSurface != null && liveSurface !== currentSurface) {
+                    currentSurface = liveSurface
+                    try { codec?.stop() } catch (_: Exception) {}
+                    try { codec?.release() } catch (_: Exception) {}
+                    codec = null
+                    val s = sps
+                    val p = pps
+                    if (s != null && p != null) {
+                        codec = initDecoder(s, p, videoWidth, videoHeight, liveSurface)
+                    }
+                }
+
                 val n = input.read(readBuf, 0, readBuf.size)
                 if (n <= 0) break
                 nalBuf.write(readBuf, 0, n)
@@ -221,30 +253,30 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 var consumed = 0
 
                 while (true) {
-                    val start = findStartCode(data, consumed)
-                    if (start < 0) break
-                    val next = findStartCode(data, start + 4)
-                    if (next < 0) break
+                    val cur = findStartCode(data, consumed) ?: break
+                    val next = findStartCode(data, cur.second) ?: break
 
-                    val nal = data.copyOfRange(start, next)
-                    val nalType = if (nal.size > 4) nal[4].toInt() and 0x1F else -1
+                    val nal = data.copyOfRange(cur.first, next.first)
+                    val payloadOff = cur.second - cur.first
+                    val nalType = if (nal.size > payloadOff) nal[payloadOff].toInt() and 0x1F else -1
 
                     when (nalType) {
                         7 -> {
+                            // Early size hint; the decoder's output format (feedNal) is
+                            // authoritative and overrides this.
                             val dims = SpsParser.parseResolution(nal)
-                            if (dims != null && dims.first != lastSpsWidth) {
-                                lastSpsWidth = dims.first
+                            if (dims != null && (dims.first != videoWidth || dims.second != videoHeight)) {
                                 videoWidth = dims.first
                                 videoHeight = dims.second
                                 listener.onVideoSize(dims.first, dims.second)
-                                Log.i(TAG, "video size changed: ${dims.first}x${dims.second}")
+                                Log.i(TAG, "video size (sps): ${dims.first}x${dims.second}")
                             }
                             sps = nal
                         }
                         8 -> pps = nal
                         5 -> {
                             if (codec == null && sps != null && pps != null) {
-                                codec = initDecoder(sps, pps, videoWidth, videoHeight, safeSurface)
+                                codec = initDecoder(sps, pps, videoWidth, videoHeight, currentSurface!!)
                             }
                         }
                     }
@@ -253,7 +285,7 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                         feedNal(codec, nal)
                     }
 
-                    consumed = next
+                    consumed = next.first
                 }
 
                 if (consumed > 0) {
@@ -273,7 +305,7 @@ class ScrcpyController(private val context: Context, private val listener: Liste
             running = false
             try { codec?.stop() } catch (_: Exception) {}
             try { codec?.release() } catch (_: Exception) {}
-            if (wasRunning) listener.onDisconnected()
+            if (wasRunning) notifyDisconnected()
         }
     }
 
@@ -308,24 +340,47 @@ class ScrcpyController(private val context: Context, private val listener: Liste
                 offset += n
             }
             val info = MediaCodec.BufferInfo()
-            var outIdx = codec.dequeueOutputBuffer(info, 0)
-            while (outIdx >= 0) {
-                codec.releaseOutputBuffer(outIdx, true)
-                outIdx = codec.dequeueOutputBuffer(info, 0)
+            while (true) {
+                val outIdx = codec.dequeueOutputBuffer(info, 0)
+                if (outIdx >= 0) {
+                    codec.releaseOutputBuffer(outIdx, true)
+                } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    // Authoritative frame size: fires on first output and on rotation,
+                    // and is correct where a hand-rolled SPS parse may drift.
+                    val f = codec.outputFormat
+                    runCatching {
+                        val w = f.getInteger(MediaFormat.KEY_WIDTH)
+                        val h = f.getInteger(MediaFormat.KEY_HEIGHT)
+                        if (w > 0 && h > 0 && (w != videoWidth || h != videoHeight)) {
+                            videoWidth = w
+                            videoHeight = h
+                            listener.onVideoSize(w, h)
+                            Log.i(TAG, "video size (decoder): ${w}x$h")
+                        }
+                    }
+                } else {
+                    break
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "feed error", e)
         }
     }
 
-    private fun findStartCode(data: ByteArray, from: Int): Int {
-        for (i in from until data.size - 3) {
-            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
-                data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
-                return i
+    /** Finds the next Annex-B start code (00 00 01 or 00 00 00 01) at or after `from`.
+     *  Returns (codeStart, payloadStart); extra leading zeros of a 4-byte code are
+     *  absorbed into codeStart. Encoders commonly emit 3-byte codes for non-IDR frames. */
+    private fun findStartCode(data: ByteArray, from: Int): Pair<Int, Int>? {
+        var i = from
+        while (i + 2 < data.size) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
+                var s = i
+                while (s > from && data[s - 1] == 0.toByte()) s--
+                return Pair(s, i + 3)
             }
+            i++
         }
-        return -1
+        return null
     }
 
     // ===== Input via control channel =====
@@ -341,8 +396,8 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         } catch (_: RejectedExecutionException) {}
     }
 
-    /** action: 1 = UP (MainActivity only reports on UP); long press = down, pause, up */
-    fun sendTouch(action: Int, x: Int, y: Int, width: Int, height: Int, isLongPress: Boolean = false) {
+    /** Tap (down+up) or long press at video-frame coordinates. */
+    fun sendTouch(x: Int, y: Int, width: Int, height: Int, isLongPress: Boolean = false) {
         if (!running) return
         val c = control ?: return
         submit {

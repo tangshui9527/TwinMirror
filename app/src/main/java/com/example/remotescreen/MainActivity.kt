@@ -143,10 +143,10 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
                             lastTapTime = 0
                         }
                         duration > 500 -> {
-                            ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, true)
+                            ctrl.sendTouch(deviceX, deviceY, videoWidth, videoHeight, true)
                         }
                         else -> {
-                            ctrl.sendTouch(1, deviceX, deviceY, videoWidth, videoHeight, false)
+                            ctrl.sendTouch(deviceX, deviceY, videoWidth, videoHeight, false)
                             lastTapTime = now
                             lastTapX = event.x
                             lastTapY = event.y
@@ -175,6 +175,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         runOnUiThread {
             connectLayout.visibility = View.VISIBLE
             videoLayout.visibility = View.GONE
+            videoLayout.keepScreenOn = false
             btnConnect.isEnabled = true
             tvStatus.text = "已断开"
         }
@@ -215,6 +216,8 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         runOnUiThread {
             connectLayout.visibility = View.GONE
             videoLayout.visibility = View.VISIBLE
+            // Controlling a remote screen with the local screen off is useless
+            videoLayout.keepScreenOn = true
         }
     }
 
@@ -223,6 +226,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
             connectLayout.visibility = View.VISIBLE
             videoLayout.visibility = View.GONE
             tvVideoStatus.visibility = View.GONE
+            videoLayout.keepScreenOn = false
             btnConnect.isEnabled = true
             tvStatus.text = "已断开"
         }

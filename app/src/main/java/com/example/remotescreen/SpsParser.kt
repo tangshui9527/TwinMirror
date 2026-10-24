@@ -60,12 +60,13 @@ object SpsParser {
             r.readBits(8) // level_idc
             r.readUe() // seq_parameter_set_id
 
+            var chromaFormatIdc = 1 // implicit 4:2:0 outside the high-profile branch
             var subWidthC = 2
             var subHeightC = 2
             if (profileIdc == 100 || profileIdc == 110 || profileIdc == 122 ||
                 profileIdc == 244 || profileIdc == 44 || profileIdc == 83 ||
                 profileIdc == 86 || profileIdc == 118 || profileIdc == 128) {
-                val chromaFormatIdc = r.readUe()
+                chromaFormatIdc = r.readUe()
                 when (chromaFormatIdc) {
                     0 -> { subWidthC = 1; subHeightC = 1 }
                     1 -> { subWidthC = 2; subHeightC = 2 }
@@ -114,9 +115,11 @@ object SpsParser {
                 val right = r.readUe()
                 val top = r.readUe()
                 val bottom = r.readUe()
-                val cropUnitX = subWidthC / (if (subWidthC == 2 && subHeightC == 2) 2 else 1)
-                val cropUnitY = subHeightC / (if (subWidthC == 2 && subHeightC == 2) 2 else 1) *
-                    (if (frameMbsOnly) 1 else 2)
+                // H.264 7.4.2.1.1: crop offsets are in units of SubWidthC x SubHeightC
+                // (x (2 - frame_mbs_only_flag)); 1 x (2 - frame_mbs_only_flag) for mono
+                val frameMul = 2 - (if (frameMbsOnly) 1 else 0)
+                val cropUnitX = if (chromaFormatIdc == 0) 1 else subWidthC
+                val cropUnitY = (if (chromaFormatIdc == 0) 1 else subHeightC) * frameMul
                 width -= (left + right) * cropUnitX
                 height -= (top + bottom) * cropUnitY
             }
