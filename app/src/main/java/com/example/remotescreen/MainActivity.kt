@@ -13,6 +13,7 @@ import android.view.SurfaceView
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -31,6 +32,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     private lateinit var tvStatus: TextView
     private lateinit var tvVideoStatus: TextView
     private lateinit var navOverlay: LinearLayout
+    private lateinit var videoArea: FrameLayout
     private lateinit var surfaceView: SurfaceView
 
     private var controller: ScrcpyController? = null
@@ -53,6 +55,8 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         tvStatus = findViewById(R.id.tvStatus)
         tvVideoStatus = findViewById(R.id.tvVideoStatus)
         navOverlay = findViewById(R.id.navOverlay)
+        videoArea = findViewById(R.id.videoArea)
+        setupNavDrag()
         surfaceView = findViewById(R.id.surfaceView)
 
         surfaceView.holder.addCallback(this)
@@ -88,11 +92,69 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
 
     private val navHandler = Handler(Looper.getMainLooper())
     private val navHide = Runnable { navOverlay.visibility = View.GONE }
+    private var navPlaced = false
+    private var navDragGrabX = 0f
+    private var navDragGrabY = 0f
+    private var navDragMoved = false
 
     private fun showNavControls() {
         navOverlay.visibility = View.VISIBLE
         navHandler.removeCallbacks(navHide)
         navHandler.postDelayed(navHide, 3500)
+        if (!navPlaced) placeNav()
+    }
+
+    /** Initial placement: last saved position, else bottom-right of the video area. */
+    private fun placeNav() {
+        videoArea.post {
+            val aw = videoArea.width
+            val ah = videoArea.height
+            if (aw == 0 || ah == 0 || navPlaced) return@post
+            navPlaced = true
+            val maxX = (aw - navOverlay.width).coerceAtLeast(0).toFloat()
+            val maxY = (ah - navOverlay.height).coerceAtLeast(0).toFloat()
+            val prefs = getPreferences(Context.MODE_PRIVATE)
+            val x = prefs.getInt("navx", Int.MIN_VALUE)
+            val y = prefs.getInt("navy", Int.MIN_VALUE)
+            navOverlay.translationX = if (x != Int.MIN_VALUE) x.toFloat().coerceIn(0f, maxX) else maxX
+            navOverlay.translationY = if (y != Int.MIN_VALUE) y.toFloat().coerceIn(0f, maxY) else (maxY - 20f).coerceAtLeast(0f)
+        }
+    }
+
+    /** Drag by the bar's padding/gaps; the buttons keep their own clicks. */
+    private fun setupNavDrag() {
+        navOverlay.isClickable = true
+        navOverlay.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    navDragGrabX = e.rawX - v.translationX
+                    navDragGrabY = e.rawY - v.translationY
+                    navDragMoved = false
+                    showNavControls()
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val maxX = (videoArea.width - v.width).coerceAtLeast(0).toFloat()
+                    val maxY = (videoArea.height - v.height).coerceAtLeast(0).toFloat()
+                    val nx = (e.rawX - navDragGrabX).coerceIn(0f, maxX)
+                    val ny = (e.rawY - navDragGrabY).coerceIn(0f, maxY)
+                    if (Math.abs(nx - v.translationX) > 2 || Math.abs(ny - v.translationY) > 2) navDragMoved = true
+                    v.translationX = nx
+                    v.translationY = ny
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (navDragMoved) {
+                        getPreferences(Context.MODE_PRIVATE).edit()
+                            .putInt("navx", v.translationX.toInt())
+                            .putInt("navy", v.translationY.toInt())
+                            .apply()
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
     }
 
     private fun setImmersiveMode(on: Boolean) {

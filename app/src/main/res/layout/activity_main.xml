@@ -102,21 +102,20 @@
                 android:textSize="16sp"
                 android:visibility="gone"/>
 
-            <!-- Translucent nav overlay: floats over the video, auto-hides -->
+            <!-- Floating draggable nav: position controlled via translation in code -->
             <LinearLayout
                 android:id="@+id/navOverlay"
-                android:layout_width="match_parent"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_gravity="bottom"
+                android:layout_gravity="top|start"
                 android:orientation="horizontal"
-                android:padding="6dp"
+                android:padding="10dp"
                 android:background="#66000000">
 
                 <Button
                     android:id="@+id/btnRecent"
-                    android:layout_width="0dp"
+                    android:layout_width="100dp"
                     android:layout_height="52dp"
-                    android:layout_weight="1"
                     android:text="Recent"
                     android:textSize="14sp"
                     android:layout_marginEnd="4dp"
@@ -124,9 +123,8 @@
 
                 <Button
                     android:id="@+id/btnHome"
-                    android:layout_width="0dp"
+                    android:layout_width="100dp"
                     android:layout_height="52dp"
-                    android:layout_weight="1"
                     android:text="Home"
                     android:textSize="14sp"
                     android:layout_marginEnd="4dp"
@@ -134,9 +132,8 @@
 
                 <Button
                     android:id="@+id/btnBack"
-                    android:layout_width="0dp"
+                    android:layout_width="100dp"
                     android:layout_height="52dp"
-                    android:layout_weight="1"
                     android:text="Back"
                     android:textSize="14sp"
                     android:layout_marginEnd="4dp"
@@ -144,9 +141,8 @@
 
                 <Button
                     android:id="@+id/btnDisconnect"
-                    android:layout_width="0dp"
+                    android:layout_width="100dp"
                     android:layout_height="52dp"
-                    android:layout_weight="1"
                     android:text="Close"
                     android:textSize="14sp"
                     android:backgroundTint="#e94560"/>
