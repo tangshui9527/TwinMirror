@@ -77,19 +77,45 @@ class ScrcpyController(private val context: Context, private val listener: Liste
 
                 dev.exec("input keyevent KEYCODE_WAKEUP", 8_000)
                 runCatching { dev.exec("wm dismiss-keyguard", 8_000) }
+                var physW = 0
+                var physH = 0
                 runCatching { dev.exec("wm size", 8_000) }.getOrNull()
                     ?.let { Regex("Physical size: (\\d+)x(\\d+)").find(it) }
-                    ?.let { Log.i(TAG, "physical ${it.groupValues[1]}x${it.groupValues[2]}") }
+                    ?.let {
+                        physW = it.groupValues[1].toInt()
+                        physH = it.groupValues[2].toInt()
+                        Log.i(TAG, "physical ${physW}x${physH}")
+                    }
 
                 listener.onLog("推送 scrcpy-server ...")
                 pushScrcpyServer(dev)
                 dev.exec("pkill -f com.genymobile.scrcpy || true", 4_000)
 
+                // Crop the target's status bar away (portrait): more pixels for the
+                // actual content and a tighter video frame. scrcpy's injected-touch
+                // mapping accounts for the crop automatically.
+                var cropArg = "-"
+                if (physW > 0 && physH > 0) {
+                    val sbh = runCatching {
+                        dev.exec("dumpsys window | grep ITYPE_STATUS_BAR", 8_000).let {
+                            Regex("ITYPE_STATUS_BAR frame=\\[0,0\\]\\[\\d+,(\\d+)\\]").find(it)
+                                ?.groupValues?.get(1)?.toIntOrNull()
+                        }
+                    }.getOrNull()
+                    if (sbh != null && sbh in 1 until physH) {
+                        cropArg = "${physW}:${physH - sbh}:0:${sbh}"
+                        Log.i(TAG, "cropping status bar: $cropArg (sbh=$sbh)")
+                    }
+                }
+                // maxSize 1600 + 10Mbps: enough to fill the controller screen sharply
+                val maxSize = 1600
+                val bitRate = 10_000_000
+
                 // The server runs in the foreground of this stream; its lifetime is the
                 // connection's lifetime, so disconnecting cleans it up automatically.
                 serverStream = dev.openStream(
                     "CLASSPATH=$SCRCPY_PATH app_process / com.genymobile.scrcpy.Server " +
-                        "$SCRCPY_VERSION info 1080 8000000 60 -1 true - false true 0 false true - - false"
+                        "$SCRCPY_VERSION info $maxSize $bitRate 60 -1 true $cropArg false true 0 false true - - false"
                 )
                 thread(name = "server-log", isDaemon = true) {
                     try {
@@ -423,8 +449,9 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         val c = control ?: return
         submit {
             c.touch(ControlChannel.ACTION_DOWN, x1, y1, width, height, ControlChannel.NORMAL_PRESSURE)
-            val steps = 8
-            val dur = durationMs.coerceIn(100, 500)
+            val dist = Math.hypot((x2 - x1).toDouble(), (y2 - y1).toDouble()).toInt()
+            val steps = (dist / 40).coerceIn(8, 24)
+            val dur = durationMs.coerceIn(150, 1000)
             for (i in 1 until steps) {
                 Thread.sleep(dur.toLong() / steps)
                 val ix = x1 + (x2 - x1) * i / steps

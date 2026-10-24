@@ -72,16 +72,26 @@
         android:orientation="vertical"
         android:visibility="gone">
 
-        <com.example.remotescreen.AspectRatioFrameLayout
-            android:id="@+id/videoFrame"
+        <!-- Full-area video stage: video centered, nav overlaid at the bottom -->
+        <FrameLayout
+            android:id="@+id/videoArea"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1">
+            android:layout_weight="1"
+            android:background="#000000">
 
-            <SurfaceView
-                android:id="@+id/surfaceView"
+            <com.example.remotescreen.AspectRatioFrameLayout
+                android:id="@+id/videoFrame"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent"/>
+                android:layout_height="match_parent"
+                android:layout_gravity="top">
+
+                <SurfaceView
+                    android:id="@+id/surfaceView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"/>
+
+            </com.example.remotescreen.AspectRatioFrameLayout>
 
             <TextView
                 android:id="@+id/tvVideoStatus"
@@ -92,56 +102,58 @@
                 android:textSize="16sp"
                 android:visibility="gone"/>
 
-        </com.example.remotescreen.AspectRatioFrameLayout>
+            <!-- Translucent nav overlay: floats over the video, auto-hides -->
+            <LinearLayout
+                android:id="@+id/navOverlay"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom"
+                android:orientation="horizontal"
+                android:padding="6dp"
+                android:background="#66000000">
 
-        <!-- Navigation Buttons -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:padding="4dp"
-            android:background="#16213e">
+                <Button
+                    android:id="@+id/btnRecent"
+                    android:layout_width="0dp"
+                    android:layout_height="52dp"
+                    android:layout_weight="1"
+                    android:text="Recent"
+                    android:textSize="14sp"
+                    android:layout_marginEnd="4dp"
+                    android:backgroundTint="#0f3460"/>
 
-            <Button
-                android:id="@+id/btnRecent"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="Recent"
-                android:textSize="14sp"
-                android:layout_marginEnd="4dp"
-                android:backgroundTint="#0f3460"/>
+                <Button
+                    android:id="@+id/btnHome"
+                    android:layout_width="0dp"
+                    android:layout_height="52dp"
+                    android:layout_weight="1"
+                    android:text="Home"
+                    android:textSize="14sp"
+                    android:layout_marginEnd="4dp"
+                    android:backgroundTint="#0f3460"/>
 
-            <Button
-                android:id="@+id/btnHome"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="Home"
-                android:textSize="14sp"
-                android:layout_marginEnd="4dp"
-                android:backgroundTint="#0f3460"/>
+                <Button
+                    android:id="@+id/btnBack"
+                    android:layout_width="0dp"
+                    android:layout_height="52dp"
+                    android:layout_weight="1"
+                    android:text="Back"
+                    android:textSize="14sp"
+                    android:layout_marginEnd="4dp"
+                    android:backgroundTint="#0f3460"/>
 
-            <Button
-                android:id="@+id/btnBack"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="Back"
-                android:textSize="14sp"
-                android:layout_marginEnd="4dp"
-                android:backgroundTint="#0f3460"/>
+                <Button
+                    android:id="@+id/btnDisconnect"
+                    android:layout_width="0dp"
+                    android:layout_height="52dp"
+                    android:layout_weight="1"
+                    android:text="Close"
+                    android:textSize="14sp"
+                    android:backgroundTint="#e94560"/>
 
-            <Button
-                android:id="@+id/btnDisconnect"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="Close"
-                android:textSize="14sp"
-                android:backgroundTint="#e94560"/>
+            </LinearLayout>
 
-        </LinearLayout>
+        </FrameLayout>
 
     </LinearLayout>
 

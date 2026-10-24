@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -28,6 +30,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     private lateinit var btnRecent: Button
     private lateinit var tvStatus: TextView
     private lateinit var tvVideoStatus: TextView
+    private lateinit var navOverlay: LinearLayout
     private lateinit var surfaceView: SurfaceView
 
     private var controller: ScrcpyController? = null
@@ -49,6 +52,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         btnRecent = findViewById(R.id.btnRecent)
         tvStatus = findViewById(R.id.tvStatus)
         tvVideoStatus = findViewById(R.id.tvVideoStatus)
+        navOverlay = findViewById(R.id.navOverlay)
         surfaceView = findViewById(R.id.surfaceView)
 
         surfaceView.holder.addCallback(this)
@@ -82,6 +86,24 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         }
     }
 
+    private val navHandler = Handler(Looper.getMainLooper())
+    private val navHide = Runnable { navOverlay.visibility = View.GONE }
+
+    private fun showNavControls() {
+        navOverlay.visibility = View.VISIBLE
+        navHandler.removeCallbacks(navHide)
+        navHandler.postDelayed(navHide, 3500)
+    }
+
+    private fun setImmersiveMode(on: Boolean) {
+        window.decorView.systemUiVisibility = if (on)
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        else
+            View.SYSTEM_UI_FLAG_VISIBLE
+    }
+
     private fun parseAddress(addr: String): Pair<String, Int> {
         val parts = addr.split(":")
         return if (parts.size == 2) {
@@ -112,9 +134,12 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
 
             val deviceX = ((event.x - offsetX) / scale).toInt().coerceIn(0, videoWidth - 1)
             val deviceY = ((event.y - offsetY) / scale).toInt().coerceIn(0, videoHeight - 1)
+            val startX = ((downX - offsetX) / scale).toInt().coerceIn(0, videoWidth - 1)
+            val startY = ((downY - offsetY) / scale).toInt().coerceIn(0, videoHeight - 1)
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    showNavControls()
                     downTime = System.currentTimeMillis()
                     downX = event.x
                     downY = event.y
@@ -129,11 +154,12 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
 
                     when {
                         distance > 50 -> {
+                            // start/end must be in the same video-frame coordinates as
+                            // taps — raw view coordinates are ~3x off and land out of bounds
                             ctrl.sendSwipeGesture(
-                                downX.toInt(), downY.toInt(),
-                                event.x.toInt(), event.y.toInt(),
+                                startX, startY, deviceX, deviceY,
                                 videoWidth, videoHeight,
-                                duration.coerceIn(100, 500).toInt()
+                                duration.coerceIn(150, 1000).toInt()
                             )
                         }
                         now - lastTapTime < 300 &&
@@ -172,10 +198,12 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     private fun disconnect() {
         controller?.disconnect()
         controller = null
+        navHandler.removeCallbacks(navHide)
         runOnUiThread {
             connectLayout.visibility = View.VISIBLE
             videoLayout.visibility = View.GONE
             videoLayout.keepScreenOn = false
+            setImmersiveMode(false)
             btnConnect.isEnabled = true
             tvStatus.text = "已断开"
         }
@@ -218,6 +246,8 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
             videoLayout.visibility = View.VISIBLE
             // Controlling a remote screen with the local screen off is useless
             videoLayout.keepScreenOn = true
+            setImmersiveMode(true)
+            showNavControls()
         }
     }
 
@@ -227,6 +257,8 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
             videoLayout.visibility = View.GONE
             tvVideoStatus.visibility = View.GONE
             videoLayout.keepScreenOn = false
+            navHandler.removeCallbacks(navHide)
+            setImmersiveMode(false)
             btnConnect.isEnabled = true
             tvStatus.text = "已断开"
         }
