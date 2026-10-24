@@ -102,50 +102,47 @@
                 android:textSize="16sp"
                 android:visibility="gone"/>
 
-            <!-- Floating draggable nav: position controlled via translation in code -->
+            <!-- Floating draggable compact nav: icons, drag by the gaps -->
             <LinearLayout
                 android:id="@+id/navOverlay"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="top|start"
                 android:orientation="horizontal"
-                android:padding="10dp"
-                android:background="#66000000">
+                android:padding="7dp"
+                android:background="@drawable/nav_pill_bg">
 
-                <Button
+                <ImageView
                     android:id="@+id/btnRecent"
-                    android:layout_width="100dp"
-                    android:layout_height="52dp"
-                    android:text="Recent"
-                    android:textSize="14sp"
-                    android:layout_marginEnd="4dp"
-                    android:backgroundTint="#0f3460"/>
+                    android:layout_width="30dp"
+                    android:layout_height="30dp"
+                    android:layout_margin="6dp"
+                    android:src="@drawable/ic_nav_recents"
+                    android:contentDescription="Recent"/>
 
-                <Button
+                <ImageView
                     android:id="@+id/btnHome"
-                    android:layout_width="100dp"
-                    android:layout_height="52dp"
-                    android:text="Home"
-                    android:textSize="14sp"
-                    android:layout_marginEnd="4dp"
-                    android:backgroundTint="#0f3460"/>
+                    android:layout_width="30dp"
+                    android:layout_height="30dp"
+                    android:layout_margin="6dp"
+                    android:src="@drawable/ic_nav_home"
+                    android:contentDescription="Home"/>
 
-                <Button
+                <ImageView
                     android:id="@+id/btnBack"
-                    android:layout_width="100dp"
-                    android:layout_height="52dp"
-                    android:text="Back"
-                    android:textSize="14sp"
-                    android:layout_marginEnd="4dp"
-                    android:backgroundTint="#0f3460"/>
+                    android:layout_width="30dp"
+                    android:layout_height="30dp"
+                    android:layout_margin="6dp"
+                    android:src="@drawable/ic_nav_back"
+                    android:contentDescription="Back"/>
 
-                <Button
+                <ImageView
                     android:id="@+id/btnDisconnect"
-                    android:layout_width="100dp"
-                    android:layout_height="52dp"
-                    android:text="Close"
-                    android:textSize="14sp"
-                    android:backgroundTint="#e94560"/>
+                    android:layout_width="30dp"
+                    android:layout_height="30dp"
+                    android:layout_margin="6dp"
+                    android:src="@drawable/ic_nav_close"
+                    android:contentDescription="Close"/>
 
             </LinearLayout>
 

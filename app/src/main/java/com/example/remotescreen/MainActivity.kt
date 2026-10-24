@@ -14,6 +14,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -25,10 +26,10 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     private lateinit var videoFrame: AspectRatioFrameLayout
     private lateinit var etAddress: EditText
     private lateinit var btnConnect: Button
-    private lateinit var btnDisconnect: Button
-    private lateinit var btnBack: Button
-    private lateinit var btnHome: Button
-    private lateinit var btnRecent: Button
+    private lateinit var btnDisconnect: ImageView
+    private lateinit var btnBack: ImageView
+    private lateinit var btnHome: ImageView
+    private lateinit var btnRecent: ImageView
     private lateinit var tvStatus: TextView
     private lateinit var tvVideoStatus: TextView
     private lateinit var navOverlay: LinearLayout
