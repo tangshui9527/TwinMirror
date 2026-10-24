@@ -72,11 +72,27 @@
         android:orientation="vertical"
         android:visibility="gone">
 
-        <SurfaceView
-            android:id="@+id/surfaceView"
+        <com.example.remotescreen.AspectRatioFrameLayout
+            android:id="@+id/videoFrame"
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1"/>
+            android:layout_weight="1">
+
+            <SurfaceView
+                android:id="@+id/surfaceView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"/>
+
+            <TextView
+                android:id="@+id/tvVideoStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:textColor="#dddddd"
+                android:textSize="16sp"
+                android:visibility="gone"/>
+
+        </com.example.remotescreen.AspectRatioFrameLayout>
 
         <!-- Navigation Buttons -->
         <LinearLayout

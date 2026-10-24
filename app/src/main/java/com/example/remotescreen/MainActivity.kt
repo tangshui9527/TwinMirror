@@ -2,6 +2,7 @@ package com.example.remotescreen
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.view.MotionEvent
@@ -18,6 +19,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
 
     private lateinit var connectLayout: LinearLayout
     private lateinit var videoLayout: LinearLayout
+    private lateinit var videoFrame: AspectRatioFrameLayout
     private lateinit var etAddress: EditText
     private lateinit var btnConnect: Button
     private lateinit var btnDisconnect: Button
@@ -25,6 +27,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     private lateinit var btnHome: Button
     private lateinit var btnRecent: Button
     private lateinit var tvStatus: TextView
+    private lateinit var tvVideoStatus: TextView
     private lateinit var surfaceView: SurfaceView
 
     private var controller: ScrcpyController? = null
@@ -37,6 +40,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
 
         connectLayout = findViewById(R.id.connectLayout)
         videoLayout = findViewById(R.id.videoLayout)
+        videoFrame = findViewById(R.id.videoFrame)
         etAddress = findViewById(R.id.etAddress)
         btnConnect = findViewById(R.id.btnConnect)
         btnDisconnect = findViewById(R.id.btnDisconnect)
@@ -44,10 +48,12 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         btnHome = findViewById(R.id.btnHome)
         btnRecent = findViewById(R.id.btnRecent)
         tvStatus = findViewById(R.id.tvStatus)
+        tvVideoStatus = findViewById(R.id.tvVideoStatus)
         surfaceView = findViewById(R.id.surfaceView)
 
         surfaceView.holder.addCallback(this)
-        etAddress.setText("192.168.31.17:5555")
+        val prefs = getPreferences(Context.MODE_PRIVATE)
+        etAddress.setText(prefs.getString("addr", "192.168.31.17:5555"))
 
         btnConnect.setOnClickListener {
             val addr = etAddress.text.toString().trim()
@@ -55,6 +61,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
                 Toast.makeText(this, "请输入目标手机 IP:端口", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
+            prefs.edit().putString("addr", addr).apply()
             val (host, port) = parseAddress(addr)
             connectTo(host, port)
         }
@@ -66,6 +73,13 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         btnRecent.setOnClickListener { controller?.sendKey(187) }
 
         setupTouchForwarding()
+
+        // Test hook: adb shell am start -n com.example.remotescreen/.MainActivity --es addr IP:PORT
+        intent.getStringExtra("addr")?.trim()?.takeIf { it.isNotEmpty() }?.let { auto ->
+            etAddress.setText(auto)
+            val (h, p) = parseAddress(auto)
+            connectTo(h, p)
+        }
     }
 
     private fun parseAddress(addr: String): Pair<String, Int> {
@@ -146,6 +160,8 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     }
 
     private fun connectTo(host: String, port: Int) {
+        controller?.disconnect()
+        controller = null
         btnConnect.isEnabled = false
         tvStatus.text = "连接中..."
         val ctrl = ScrcpyController(this, this)
@@ -165,7 +181,13 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     }
 
     override fun onLog(msg: String) {
-        runOnUiThread { tvStatus.text = msg }
+        runOnUiThread {
+            tvStatus.text = msg
+            if (controller?.isRunning() == true) {
+                tvVideoStatus.visibility = View.VISIBLE
+                tvVideoStatus.text = msg
+            }
+        }
     }
 
     override fun onError(msg: String) {
@@ -179,6 +201,14 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
     override fun onVideoSize(width: Int, height: Int) {
         videoWidth = width
         videoHeight = height
+        videoFrame.post {
+            videoFrame.aspectRatio = width.toFloat() / height
+            videoFrame.requestLayout()
+        }
+        // The H.264 decoder fires this with real stream dimensions on its first frame;
+        // the fallback screenshot path reports the wm size right after connect. Either
+        // way the status overlay has done its job once dimensions are known.
+        runOnUiThread { tvVideoStatus.visibility = View.GONE }
     }
 
     override fun onConnected() {
@@ -192,6 +222,7 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
         runOnUiThread {
             connectLayout.visibility = View.VISIBLE
             videoLayout.visibility = View.GONE
+            tvVideoStatus.visibility = View.GONE
             btnConnect.isEnabled = true
             tvStatus.text = "已断开"
         }
@@ -204,7 +235,10 @@ class MainActivity : Activity(), ScrcpyController.Listener, SurfaceHolder.Callba
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {}
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        VideoDecoderHolder.surface = null
+        VideoDecoderHolder.holder = null
+    }
 
     override fun onDestroy() {
         disconnect()

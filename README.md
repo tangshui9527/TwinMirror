@@ -4,38 +4,30 @@ Android 局域网远程投屏控制器：在控制端手机上实时查看并操
 
 ## 功能
 
-- 实时查看目标手机屏幕（截图轮询刷新）
-- 触摸点击、滑动、长按（自动映射坐标到目标分辨率）
+- 实时查看目标手机屏幕（scrcpy 协议 H.264 硬件编解码，20-30 fps，支持 3D 游戏）
+- 触摸点击、滑动（真实多点触控轨迹）、长按（scrcpy 控制通道直接注入，约 10ms 延迟）
 - 导航按键：返回 / 主页 / 最近任务
 - 双击唤醒目标手机屏幕
 - WiFi 局域网 ADB 连接（也可用 USB 调试 + 无线调试开启）
+- 地址记忆：输入过一次的 IP 会自动记住
 
 ## 工作原理
 
 ```
 控制端手机                          目标手机
-┌─────────────┐    WiFi/局域网    ┌─────────────┐
-│ RemoteScreen │◄── adb server ──►│ adbd :5555  │
-│  内置 adb 二进制 │                 │  screencap  │
-└─────────────┘                   └─────────────┘
+┌──────────────┐   WiFi/局域网   ┌──────────────────┐
+│ TwinMirror    │◄── 直连 ADB ──►│ adbd :5555        │
+│  AdbDevice    │               │  └ scrcpy-server   │
+│  MediaCodec   │               │    (app_process)   │
+│  控制通道注入  │               │    MediaCodec 编码 │
+└──────────────┘               └──────────────────┘
 ```
 
-1. App 内置了完整的 `adb` 二进制，启动连目标手机 `IP:5555`（目标需要已开启"USB 调试（网络 adb）"，或先 USB 连一次执行 `adb tcpip 5555`）
-2. 画面：循环执行 `adb shell screencap` 抓 PNG，解码显示（约 1-2 fps）
-3. 触摸/按键：把屏幕坐标映射到目标分辨率后执行 `adb shell input tap/swipe/keyevent`
-4. 双击唤醒：`input keyevent KEYCODE_WAKEUP` + `wm dismiss-keyguard`
-
-## 使用方法
-
-**目标手机（被投屏端）准备**（一次即可）：
-- 打开开发者选项 → USB 调试 → 允许"网络 ADB 调试"
-- 或先用数据线连电脑执行 `adb tcpip 5555`
-
-**控制端手机**：
-1. 安装 APK，打开 App（Android 11+ 会请求 nearby devices 权限）
-2. 输入目标手机 IP（默认端口 5555），点连接
-3. 首次连接目标手机会弹出 ADB 授权对话框，点允许
-4. 开始投屏，触摸直接操作
+1. **直连 ADB 协议**：App 内置了完整的 ADB 协议实现（CNXN/AUTH/OPEN/WRTE），通过 TCP 直接与目标机的 adbd 通信——**不再打包 adb 二进制**（旧方案在部分 ROM 上 server/client 都不可靠）。RSA 密钥首次生成并持久化，首次连接需在目标手机上允许一次（勾选"永远允许"后永久生效）。
+2. **scrcpy-server**：把 41KB 的 scrcpy-server 推到 `/data/local/tmp`，通过 `app_process` 启动。服务端用 SurfaceControl + MediaCodec 在目标机上硬件编码屏幕，经 `localabstract:scrcpy` 通道流出（不需要 `adb forward`，adbd 的 `localabstract` 服务直通）。
+3. **解码渲染**：控制端 MediaCodec 硬解，直接渲染到 SurfaceView（csd 预配置，SPS 变化自动跟踪旋转）。
+4. **输入注入**：触摸/按键通过 scrcpy 控制通道由服务端直接注入事件（~10ms），滑动带完整轨迹，替代逐条 `input` 命令。
+5. 目标机保持唤醒由 server 的 stayAwake 选项负责，断开连接时 server 随之退出并自动恢复。
 
 ## 构建
 
@@ -45,28 +37,32 @@ gradle assembleDebug
 # 产物: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-- minSdk 21 / targetSdk 28
-- 依赖：无第三方库，全部系统 API
+- minSdk 26 / targetSdk 28
+- 依赖：无第三方库（scrcpy-server v1.18 随资产分发，Apache-2.0）
 
 ## 项目结构
 
 ```
 app/src/main/
 ├── AndroidManifest.xml
-├── assets/adb                 # 内置 adb 二进制（安卓版，无需 root）
+├── assets/scrcpy_server        # scrcpy v1.18 server（推送到目标机运行）
 └── java/com/example/remotescreen/
-    ├── MainActivity.kt        # 界面、触摸手势回调、双击唤醒
-    ├── ScrcpyController.kt    # 投屏核心：截图轮询线程 + 命令队列
-    └── AdbClient.kt           # adb 封装：connect / shell / exec-out
+    ├── MainActivity.kt         # 界面、触摸手势、地址记忆
+    ├── ScrcpyController.kt     # 会话编排：推 server/启动/视频解码/控制通道
+    ├── AdbDevice.kt            # 直连 ADB 协议（CNXN/AUTH/OPEN/WRTE + shell v2）
+    ├── ControlChannel.kt       # scrcpy 控制消息（触摸/按键注入）
+    ├── SpsParser.kt            # 从 SPS 解析分辨率（旋转跟踪）
+    └── AspectRatioFrameLayout.kt  # 视频区宽高比自适应容器
 ```
 
 ## 已知限制
 
-- 画面刷新率约 1-2 fps（screencap 轮询方案），只适合验证/演示，不适合看视频
-- 需要目标手机开启"网络 ADB 调试"，adb 授权对话框需手动确认一次
+- scrcpy v1.18 server 在 Android 11 及以下验证可用（魅族 17 Pro / Android 11 ✓）；更新的 Android（12+）建议升级 scrcpy-server 到 2.x 并适配新协议
+- 投屏过程旋转目标机屏幕：分辨率会跟随（SPS 跟踪），触摸映射自动切换
 - 局域网内使用（不跨公网）
 
 ## 分支说明
 
-- `master`：本 README 所述方案（ADB 截图轮询，稳定可用）
-- `scrcpy-wip`：实验分支——基于 scrcpy v1.18 协议的 H.264 实时流方案（视频可达 30+ fps、点击延迟 ~10ms），已完成视频通路与注入协议验证，工程侧还差收尾工作
+- `master`：本 README 所述方案（直连 ADB 协议 + scrcpy-server）
+- `scrcpy-wip`：旧实验分支（spawn 式 adb + forward，触摸消息错位未修复），已被 master 取代
+- `backup/pre-h264-20261024`：重构前的截图轮询方案备份

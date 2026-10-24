@@ -1,14 +1,25 @@
 package com.example.remotescreen
 
 import android.content.Context
-import android.graphics.BitmapFactory
+import android.media.MediaCodec
+import android.media.MediaFormat
 import android.util.Log
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
+import java.io.BufferedInputStream
+import java.io.DataInputStream
+import java.io.IOException
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
- * Screen mirroring using screencap polling + input commands for control.
+ * Screen mirroring via scrcpy-server (v1.18): the server jar is pushed to
+ * /data/local/tmp, started through app_process via the direct ADB protocol
+ * (AdbDevice), and streams hardware-encoded H.264 over an adbd `localabstract:`
+ * tunnel — no adb forward, no screenrecord quirks. Input goes through the scrcpy
+ * control channel (~10ms injection) instead of `input` commands.
  */
 class ScrcpyController(private val context: Context, private val listener: Listener) {
 
@@ -20,189 +31,385 @@ class ScrcpyController(private val context: Context, private val listener: Liste
         fun onDisconnected()
     }
 
-    private var adb: AdbClient? = null
-    private var captureThread: Thread? = null
-    private var keepAliveThread: Thread? = null
-    @Volatile private var running = false
-    private var deviceWidth = 0
-    private var deviceHeight = 0
+    private val keyPair = AdbDevice.loadOrCreateKey(context)
+    private var device: AdbDevice? = null
+    private var videoStream: AdbDevice.ShellStream? = null
+    private var controlStream: AdbDevice.ShellStream? = null
+    private var control: ControlChannel? = null
+    private var serverStream: AdbDevice.ShellStream? = null
+    private var videoThread: Thread? = null
 
-    // Touch command queue to serialize ADB input commands
-    private val cmdQueue = LinkedBlockingQueue<String>()
-    private var cmdThread: Thread? = null
+    @Volatile private var running = false
+    @Volatile private var cancelled = false
+    private val disconnected = AtomicBoolean(false)
+
+    // Physical screen size (from wm size, for logs)
+    private var devicePhysicalWidth = 0
+    private var devicePhysicalHeight = 0
+
+    // Current video frame size (touch injection coordinate frame; updated on rotation via SPS)
+    private var videoWidth = 0
+    private var videoHeight = 0
+
+    private var inputExecutor = newInputExecutor()
+
+    private fun newInputExecutor() = Executors.newSingleThreadExecutor { r ->
+        thread(name = "control-input", isDaemon = true) { r.run() }
+    }
+
+    companion object {
+        private const val TAG = "RemoteScreen"
+        private const val SCRCPY_PATH = "/data/local/tmp/scrcpy-server.jar"
+        private const val SCRCPY_VERSION = "1.18"
+        private const val SOCKET_NAME = "localabstract:scrcpy"
+    }
 
     fun connect(host: String, port: Int) {
         thread(name = "connect") {
             try {
-                listener.onLog("连接 ADB: $host:$port ...")
-                val client = AdbClient(context, host, port)
-                client.connect()
-                adb = client
-                listener.onLog("ADB 已连接")
+                listener.onLog("连接目标设备: $host:$port ...")
+                val dev = AdbDevice(host, port)
+                dev.connect(keyPair) { listener.onLog("请在目标手机上允许 ADB 调试 ...") }
+                if (cancelled) { dev.close(); return@thread }
+                device = dev
 
-                // Wake up and keep screen on
-                listener.onLog("唤醒目标设备 ...")
-                client.execShell("input keyevent KEYCODE_WAKEUP")
-                client.execShell("wm dismiss-keyguard")
-                client.execShell("settings put system screen_off_timeout 1800000")
-                try { client.execShell("svc power stayon true") } catch (_: Exception) {}
-                Thread.sleep(200)
-
-                // Get screen resolution
-                val wmSize = client.execShell("wm size")
-                val resMatch = Regex("Physical size: (\\d+)x(\\d+)").find(wmSize)
-                if (resMatch != null) {
-                    deviceWidth = resMatch.groupValues[1].toInt()
-                    deviceHeight = resMatch.groupValues[2].toInt()
-                } else {
-                    deviceWidth = 1080
-                    deviceHeight = 2340
+                dev.exec("input keyevent KEYCODE_WAKEUP", 8_000)
+                runCatching { dev.exec("wm dismiss-keyguard", 8_000) }
+                val wmSize = dev.exec("wm size", 8_000)
+                Regex("Physical size: (\\d+)x(\\d+)").find(wmSize)?.let {
+                    devicePhysicalWidth = it.groupValues[1].toInt()
+                    devicePhysicalHeight = it.groupValues[2].toInt()
                 }
-                listener.onLog("屏幕: ${deviceWidth}x$deviceHeight")
-                listener.onVideoSize(deviceWidth, deviceHeight)
+                Log.i(TAG, "physical ${devicePhysicalWidth}x${devicePhysicalHeight}")
+
+                listener.onLog("推送 scrcpy-server ...")
+                pushScrcpyServer(dev)
+                dev.exec("pkill -f com.genymobile.scrcpy || true", 4_000)
+
+                // The server runs in the foreground of this stream; its lifetime is the
+                // connection's lifetime, so disconnecting cleans it up automatically.
+                serverStream = dev.openStream(
+                    "CLASSPATH=$SCRCPY_PATH app_process / com.genymobile.scrcpy.Server " +
+                        "$SCRCPY_VERSION info 1080 8000000 60 -1 true - false true 0 false true - - false"
+                )
+                thread(name = "server-log", isDaemon = true) {
+                    try {
+                        val buf = ByteArray(4096)
+                        val inp = serverStream!!.input
+                        while (true) {
+                            val n = inp.read(buf)
+                            if (n < 0) break
+                            val line = String(buf, 0, n).trim()
+                            if (line.isNotEmpty()) Log.i(TAG, "server: $line")
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                listener.onLog("连接视频流 ...")
+                val video = openVideoSocket()
+                controlStream = openControlSocket()
+                control = ControlChannel(controlStream!!.output())
+
+                val vIn = DataInputStream(BufferedInputStream(video.input, 65536))
+                val ack = vIn.readUnsignedByte()
+                if (ack != 0) throw IOException("视频流 ACK 异常: $ack")
+                val nameBytes = ByteArray(64)
+                vIn.readFully(nameBytes)
+                val deviceName = String(nameBytes).trim { it <= ' ' || it == '\u0000' }
+                val w = ((vIn.readUnsignedByte() shl 8) or vIn.readUnsignedByte())
+                val h = ((vIn.readUnsignedByte() shl 8) or vIn.readUnsignedByte())
+                videoWidth = w
+                videoHeight = h
+                Log.i(TAG, "device: $deviceName, video ${w}x$h")
+                listener.onVideoSize(w, h)
 
                 running = true
                 listener.onConnected()
+                listener.onLog("已连接 ($deviceName, ${w}x$h)")
 
-                // Start command worker
-                cmdThread = thread(name = "cmd-worker", isDaemon = true) {
-                    while (running) {
-                        try {
-                            val cmd = cmdQueue.poll(100, TimeUnit.MILLISECONDS)
-                            if (cmd != null) {
-                                adb?.execShell(cmd)
-                            }
-                        } catch (e: InterruptedException) { break }
-                          catch (e: Exception) { Log.e(TAG, "Cmd failed", e) }
-                    }
+                videoThread = thread(name = "video-decode", isDaemon = true) {
+                    decodeLoop(vIn)
                 }
-
-                // Start keep-alive
-                keepAliveThread = thread(name = "keep-alive", isDaemon = true) {
-                    while (running) {
-                        Thread.sleep(30000)
-                        if (running) adb?.execShell("input keyevent KEYCODE_WAKEUP")
-                    }
-                }
-
-                // Start screen capture polling
-                captureThread = thread(name = "screen-capture", isDaemon = true) {
-                    captureLoop()
-                }
-
-            } catch (e: Exception) {
+            } catch (e: AdbDevice.UnauthorizedException) {
+                Log.e(TAG, "Connect failed: unauthorized", e)
                 listener.onError("连接失败: ${e.message}")
+                disconnect()
+            } catch (e: Exception) {
                 Log.e(TAG, "Connect failed", e)
+                listener.onError("连接失败: ${e.message}")
                 disconnect()
             }
         }
     }
 
-    private fun captureLoop() {
-        var failCount = 0
-        while (running) {
+    private fun openVideoSocket(): AdbDevice.ShellStream {
+        var last: Exception? = null
+        repeat(20) {
+            if (cancelled) throw IOException("cancelled")
             try {
-                val client = adb ?: break
-                val proc = client.openExecOut("screencap -p")
-                val bytes = proc.inputStream.readBytes()
-                // Wait with timeout to avoid hanging
-                if (!proc.waitFor(5, TimeUnit.SECONDS)) {
-                    proc.destroyForcibly()
-                    throw RuntimeException("screencap timeout")
-                }
-
-                if (bytes.isNotEmpty() && running) {
-                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    if (bitmap != null) {
-                        drawToSurface(bitmap)
-                        bitmap.recycle()
-                        failCount = 0
-                    }
-                }
-
-                Thread.sleep(200) // ~5 FPS
-            } catch (e: Exception) {
-                failCount++
-                Log.e(TAG, "Capture failed ($failCount)", e)
-                if (failCount > 10) {
-                    if (running) listener.onError("截图失败多次: ${e.message}")
-                    break
-                }
-                Thread.sleep(1000)
-            }
+                return device!!.openRawStream(SOCKET_NAME, 3_000)
+            } catch (e: Exception) { last = e }
+            Thread.sleep(400)
         }
-        running = false
-        listener.onDisconnected()
+        throw RuntimeException("无法连接视频通道: ${last?.message}")
     }
 
-    private fun drawToSurface(bitmap: android.graphics.Bitmap) {
-        val holder = VideoDecoderHolder.holder ?: return
-        try {
-            val canvas = holder.lockCanvas() ?: return
+    private fun openControlSocket(): AdbDevice.ShellStream {
+        var last: Exception? = null
+        repeat(10) {
             try {
-                canvas.drawColor(android.graphics.Color.BLACK)
-                val bw = bitmap.width.toFloat()
-                val bh = bitmap.height.toFloat()
-                val cw = canvas.width.toFloat()
-                val ch = canvas.height.toFloat()
-                val scale = minOf(cw / bw, ch / bh)
-                val dx = (cw - bw * scale) / 2
-                val dy = (ch - bh * scale) / 2
-                canvas.drawBitmap(bitmap, null, android.graphics.RectF(dx, dy, dx + bw * scale, dy + bh * scale), null)
-            } finally {
-                holder.unlockCanvasAndPost(canvas)
+                return device!!.openRawStream(SOCKET_NAME, 3_000)
+            } catch (e: Exception) { last = e }
+            Thread.sleep(300)
+        }
+        throw RuntimeException("无法连接控制通道: ${last?.message}")
+    }
+
+    private fun pushScrcpyServer(dev: AdbDevice) {
+        val jar = context.assets.open("scrcpy_server").use { it.readBytes() }
+        val existing = runCatching {
+            dev.exec("stat -c %s $SCRCPY_PATH 2>/dev/null || echo missing", 5_000).trim()
+        }.getOrNull()
+        if (existing == jar.size.toString()) {
+            Log.i(TAG, "scrcpy-server already pushed (${jar.size} bytes)")
+            return
+        }
+        Log.i(TAG, "pushing scrcpy-server (${jar.size} bytes), remote=$existing")
+        val push = dev.openStream("cat > $SCRCPY_PATH", 5_000)
+        push.writeStdin(jar)
+        push.closeStdin()
+        // wait for cat to finish (stream EOFs when the shell exits)
+        val deadline = System.currentTimeMillis() + 10_000
+        try {
+            val buf = ByteArray(4096)
+            val inp = push.input
+            while (System.currentTimeMillis() < deadline) {
+                if (inp.read(buf) < 0) break
+            }
+        } catch (_: Exception) {}
+        push.close()
+        dev.exec("chmod 644 $SCRCPY_PATH", 4_000)
+        val check = dev.exec("stat -c %s $SCRCPY_PATH", 4_000).trim()
+        if (check != jar.size.toString()) throw IOException("推送校验失败: $check != ${jar.size}")
+    }
+
+    private fun decodeLoop(input: DataInputStream) {
+        var codec: MediaCodec? = null
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
+        var lastSpsWidth = 0
+        try {
+            // The SurfaceView surface exists only after the video layout becomes visible
+            var surface = VideoDecoderHolder.surface
+            var waited = 0
+            while (surface == null && waited < 5000) {
+                Thread.sleep(100)
+                waited += 100
+                surface = VideoDecoderHolder.surface
+            }
+            val safeSurface = surface ?: throw IllegalStateException("Surface not ready")
+
+            val readBuf = ByteArray(65536)
+            val nalBuf = java.io.ByteArrayOutputStream(256 * 1024)
+
+            while (running) {
+                val n = input.read(readBuf, 0, readBuf.size)
+                if (n <= 0) break
+                nalBuf.write(readBuf, 0, n)
+
+                val data = nalBuf.toByteArray()
+                var consumed = 0
+
+                while (true) {
+                    val start = findStartCode(data, consumed)
+                    if (start < 0) break
+                    val next = findStartCode(data, start + 4)
+                    if (next < 0) break
+
+                    val nal = data.copyOfRange(start, next)
+                    val nalType = if (nal.size > 4) nal[4].toInt() and 0x1F else -1
+
+                    when (nalType) {
+                        7 -> {
+                            val dims = SpsParser.parseResolution(nal)
+                            if (dims != null && dims.first != lastSpsWidth) {
+                                lastSpsWidth = dims.first
+                                videoWidth = dims.first
+                                videoHeight = dims.second
+                                listener.onVideoSize(dims.first, dims.second)
+                                Log.i(TAG, "video size changed: ${dims.first}x${dims.second}")
+                            }
+                            sps = nal
+                        }
+                        8 -> pps = nal
+                        5 -> {
+                            if (codec == null && sps != null && pps != null) {
+                                codec = initDecoder(sps, pps, videoWidth, videoHeight, safeSurface)
+                            }
+                        }
+                    }
+
+                    if (codec != null) {
+                        feedNal(codec, nal)
+                    }
+
+                    consumed = next
+                }
+
+                if (consumed > 0) {
+                    val remaining = data.copyOfRange(consumed, data.size)
+                    nalBuf.reset()
+                    nalBuf.write(remaining)
+                }
+                if (nalBuf.size() > 4 * 1024 * 1024) nalBuf.reset()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Draw failed", e)
+            if (running) {
+                Log.e(TAG, "Decode error", e)
+                listener.onError("视频错误: ${e.message}")
+            }
+        } finally {
+            val wasRunning = running
+            running = false
+            try { codec?.stop() } catch (_: Exception) {}
+            try { codec?.release() } catch (_: Exception) {}
+            if (wasRunning) listener.onDisconnected()
         }
     }
 
-    /** Send tap or long press at device coordinates */
+    private fun initDecoder(sps: ByteArray, pps: ByteArray, w: Int, h: Int, surface: android.view.Surface): MediaCodec? {
+        return try {
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024)
+            format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
+            format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
+            val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            c.configure(format, surface, null, 0)
+            c.start()
+            Log.i(TAG, "decoder started ${w}x$h")
+            c
+        } catch (e: Exception) {
+            Log.e(TAG, "init decoder failed", e)
+            null
+        }
+    }
+
+    private fun feedNal(codec: MediaCodec, nal: ByteArray) {
+        try {
+            var offset = 0
+            while (offset < nal.size && running) {
+                val idx = codec.dequeueInputBuffer(10_000)
+                if (idx < 0) continue
+                val buf = codec.getInputBuffer(idx) ?: return
+                buf.clear()
+                val n = minOf(nal.size - offset, buf.remaining())
+                buf.put(nal, offset, n)
+                codec.queueInputBuffer(idx, 0, n, 0, 0)
+                offset += n
+            }
+            val info = MediaCodec.BufferInfo()
+            var outIdx = codec.dequeueOutputBuffer(info, 0)
+            while (outIdx >= 0) {
+                codec.releaseOutputBuffer(outIdx, true)
+                outIdx = codec.dequeueOutputBuffer(info, 0)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "feed error", e)
+        }
+    }
+
+    private fun findStartCode(data: ByteArray, from: Int): Int {
+        for (i in from until data.size - 3) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
+                data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
+                return i
+            }
+        }
+        return -1
+    }
+
+    // ===== Input via control channel =====
+
+    private fun submit(block: () -> Unit) {
+        synchronized(this) {
+            if (inputExecutor.isShutdown) inputExecutor = newInputExecutor()
+        }
+        try {
+            inputExecutor.execute {
+                try { block() } catch (e: Exception) { Log.e(TAG, "input inject failed", e) }
+            }
+        } catch (_: RejectedExecutionException) {}
+    }
+
+    /** action: 1 = UP (MainActivity only reports on UP); long press = down, pause, up */
     fun sendTouch(action: Int, x: Int, y: Int, width: Int, height: Int, isLongPress: Boolean = false) {
-        if (!running || deviceWidth == 0) return
-        val dx = (x * deviceWidth / width).coerceIn(0, deviceWidth - 1)
-        val dy = (y * deviceHeight / height).coerceIn(0, deviceHeight - 1)
-        if (action == 1) {
-            val cmd = if (isLongPress) "input swipe $dx $dy $dx $dy 800" else "input tap $dx $dy"
-            cmdQueue.offer(cmd)
+        if (!running) return
+        val c = control ?: return
+        submit {
+            if (isLongPress) {
+                c.touch(ControlChannel.ACTION_DOWN, x, y, width, height, ControlChannel.NORMAL_PRESSURE)
+                Thread.sleep(700)
+                c.touch(ControlChannel.ACTION_UP, x, y, width, height, ControlChannel.NO_PRESSURE)
+            } else {
+                c.touch(ControlChannel.ACTION_DOWN, x, y, width, height, ControlChannel.NORMAL_PRESSURE)
+                c.touch(ControlChannel.ACTION_UP, x, y, width, height, ControlChannel.NO_PRESSURE)
+            }
         }
     }
 
-    /** Send swipe gesture from (x1,y1) to (x2,y2) in view coordinates */
     fun sendSwipeGesture(x1: Int, y1: Int, x2: Int, y2: Int, width: Int, height: Int, durationMs: Int = 300) {
-        if (!running || deviceWidth == 0) return
-        val dx1 = (x1 * deviceWidth / width).coerceIn(0, deviceWidth - 1)
-        val dy1 = (y1 * deviceHeight / height).coerceIn(0, deviceHeight - 1)
-        val dx2 = (x2 * deviceWidth / width).coerceIn(0, deviceWidth - 1)
-        val dy2 = (y2 * deviceHeight / height).coerceIn(0, deviceHeight - 1)
-        cmdQueue.offer("input swipe $dx1 $dy1 $dx2 $dy2 $durationMs")
+        if (!running) return
+        val c = control ?: return
+        submit {
+            c.touch(ControlChannel.ACTION_DOWN, x1, y1, width, height, ControlChannel.NORMAL_PRESSURE)
+            val steps = 8
+            val dur = durationMs.coerceIn(100, 500)
+            for (i in 1 until steps) {
+                Thread.sleep(dur.toLong() / steps)
+                val ix = x1 + (x2 - x1) * i / steps
+                val iy = y1 + (y2 - y1) * i / steps
+                c.touch(ControlChannel.ACTION_MOVE, ix, iy, width, height, ControlChannel.NORMAL_PRESSURE)
+            }
+            Thread.sleep(dur.toLong() / steps)
+            c.touch(ControlChannel.ACTION_UP, x2, y2, width, height, ControlChannel.NO_PRESSURE)
+        }
     }
 
     fun sendKey(keycode: Int) {
         if (!running) return
-        cmdQueue.offer("input keyevent $keycode")
+        val c = control ?: return
+        submit { c.tapKey(keycode) }
     }
 
     fun wakeUp() {
         if (!running) return
-        cmdQueue.offer("input keyevent KEYCODE_WAKEUP")
-        cmdQueue.offer("wm dismiss-keyguard")
+        val c = control ?: return
+        submit {
+            c.tapKey(224) // KEYCODE_WAKEUP
+        }
     }
 
     fun disconnect() {
+        cancelled = true
         running = false
-        cmdQueue.clear()
-        try { keepAliveThread?.interrupt() } catch (_: Exception) {}
-        try { captureThread?.interrupt() } catch (_: Exception) {}
-        try { cmdThread?.interrupt() } catch (_: Exception) {}
-        try { adb?.close() } catch (_: Exception) {}
-        adb = null
-        listener.onDisconnected()
+        val dev = device
+        try { videoStream?.close() } catch (_: Exception) {}
+        try { controlStream?.close() } catch (_: Exception) {}
+        try { serverStream?.close() } catch (_: Exception) {}
+        try { videoThread?.interrupt() } catch (_: Exception) {}
+        try { inputExecutor.shutdownNow() } catch (_: Exception) {}
+        try { dev?.close() } catch (_: Exception) {}
+        device = null
+        control = null
+        notifyDisconnected()
+    }
+
+    private fun notifyDisconnected() {
+        if (disconnected.compareAndSet(false, true)) {
+            running = false
+            listener.onDisconnected()
+        }
     }
 
     fun isRunning(): Boolean = running
-
-    companion object {
-        private const val TAG = "RemoteScreen"
-    }
 }
