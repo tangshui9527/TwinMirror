@@ -9,6 +9,7 @@ import java.io.DataInputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.security.KeyPair
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -49,9 +50,14 @@ class ScrcpyController(private val context: Context, private val listener: Liste
 
     private var inputExecutor = newInputExecutor()
 
-    private fun newInputExecutor() = Executors.newSingleThreadExecutor { r ->
-        thread(name = "control-input", isDaemon = true) { r.run() }
-    }
+    private fun newInputExecutor(): ExecutorService =
+        Executors.newSingleThreadExecutor { r ->
+            // A ThreadFactory must only CREATE the thread — kotlin.concurrent.thread()
+            // starts it immediately, and the pool's own start() then throws
+            // IllegalThreadStateException on the caller (UI) thread, crashing on the
+            // first injected input.
+            Thread(r, "control-input").apply { isDaemon = true }
+        }
 
     companion object {
         private const val TAG = "RemoteScreen"
